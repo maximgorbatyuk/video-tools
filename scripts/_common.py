@@ -7,8 +7,10 @@ It exposes:
     Log helpers:    info / ok / warn / err / die
     Preflight:      check_yt_dlp, check_ffmpeg, check_claude
     YouTube:        YOUTUBE_ID_RE, prompt_youtube_url, get_video_id,
-                    get_video_title, download_video,
-                    download_subtitles_for_lang
+                    get_video_title, get_video_metadata,
+                    available_video_heights, available_subtitle_langs,
+                    download_video, download_subtitles_for_lang
+    Artifacts:      find_existing_artifacts
     Results folder: video_title_to_slug, find_or_create_results_dir
     SRT:            SRT_TIMECODE_RE, count_cue_blocks
 
@@ -18,6 +20,7 @@ Keep this module side-effect-free at import time.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -152,17 +155,82 @@ def get_video_title(url: str) -> str:
     return (result.stdout or "").strip().splitlines()[-1] if result.stdout else ""
 
 
-def download_video(url: str, video_id: str) -> Path:
-    """Download at 720p if not already on disk; return path to the .mp4."""
+def get_video_metadata(url: str) -> dict:
+    """
+    Return yt-dlp's full JSON metadata for the URL.
+
+    One round-trip (~1–2s). Callers use the result to enumerate available
+    video heights and subtitle languages without further yt-dlp invocations.
+    """
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "-J", "--no-warnings", url],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        die(
+            "yt-dlp failed to fetch video metadata.",
+            f"yt-dlp stderr:\n{e.stderr}",
+        )
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        die(f"yt-dlp returned invalid JSON metadata: {e}")
+    return {}  # unreachable; die() exits — keeps the type-checker happy
+
+
+def available_video_heights(metadata: dict) -> list[int]:
+    """
+    Pure parser: extract the sorted-ascending unique list of video heights
+    available in yt-dlp metadata. Audio-only formats and entries without a
+    height are dropped.
+    """
+    heights: set[int] = set()
+    for fmt in metadata.get("formats", []) or []:
+        if not isinstance(fmt, dict):
+            continue
+        if fmt.get("vcodec") in (None, "none"):
+            continue
+        h = fmt.get("height")
+        if isinstance(h, int) and h > 0:
+            heights.add(h)
+    return sorted(heights)
+
+
+def available_subtitle_langs(metadata: dict) -> list[str]:
+    """
+    Pure parser: return the sorted unique list of subtitle language codes
+    advertised by yt-dlp — merging manual subs and automatic captions, since
+    download_subtitles_for_lang handles both.
+    """
+    langs: set[str] = set()
+    for key in ("subtitles", "automatic_captions"):
+        section = metadata.get(key) or {}
+        if not isinstance(section, dict):
+            continue
+        for code in section.keys():
+            if isinstance(code, str) and code.strip():
+                langs.add(code.strip())
+    return sorted(langs)
+
+
+def download_video(url: str, video_id: str, max_height: int = 720) -> Path:
+    """
+    Download the video at <= `max_height`p if not already on disk; return
+    the path to the .mp4. Default ceiling is 720p (transcribe.py's
+    expectation); translate.py passes the user-chosen height.
+    """
     out_path = Path(f"{video_id}.mp4")
     if out_path.exists():
         ok(f"video already downloaded: {out_path}  (skipping download)")
         return out_path
 
-    info(f"downloading {url}  →  {out_path}")
+    info(f"downloading {url} at <= {max_height}p  →  {out_path}")
     cmd = [
         "yt-dlp",
-        "-f", "bv*[height<=720]+ba/b[height<=720]",
+        "-f", f"bv*[height<={max_height}]+ba/b[height<={max_height}]",
         "--merge-output-format", "mp4",
         "-o", f"{video_id}.%(ext)s",
         url,
@@ -247,7 +315,24 @@ _RESULTS_DIR_MARKERS = (
     "{vid}.txt",
     "{vid}.summary.md",
     "{vid}.translate-source-lang.txt",
+    "{vid}.translate-target-lang.txt",
+    "{vid}.video-quality.txt",
 )
+
+
+def find_existing_artifacts(video_id: str) -> tuple[Optional[Path], list[Path]]:
+    """
+    Inspect the CWD for a previous translate.py run's downloads.
+
+    Returns (mp4 path or None, list of per-language SRT paths). The SRT
+    list matches `<ID>.<anything>.srt` — that covers `<ID>.en.srt`,
+    `<ID>.zh-Hans.srt`, etc. without picking up `<ID>.srt` (the whisper
+    output of transcribe.py).
+    """
+    mp4 = Path(f"{video_id}.mp4")
+    mp4_path: Optional[Path] = mp4 if mp4.exists() else None
+    srts = [p for p in sorted(Path(".").glob(f"{video_id}.*.srt"))]
+    return mp4_path, srts
 
 
 def video_title_to_slug(title: str, max_len: int = 60) -> str:

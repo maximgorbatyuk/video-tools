@@ -23,15 +23,18 @@ this file as the agent-facing rulebook.
 
 ```
 video-tools/
-├── start.py                 ← interactive entrypoint, dispatches to scripts/
+├── start.py                       ← interactive entrypoint, dispatches to scripts/
 ├── scripts/
-│   ├── transcribe.py        ← functional script (mlx_whisper + optional claude summary)
-│   ├── translate.py         ← functional script (claude)
-│   └── _common.py           ← shared helpers (NOT a runnable script)
+│   ├── transcribe.py              ← functional script (mlx_whisper + optional claude summary)
+│   ├── translate.py               ← functional script (claude — download + translate)
+│   └── _common.py                 ← shared helpers (NOT a runnable script)
 ├── prompts/
-│   └── summary_prompt.md    ← prompt template consumed by transcribe.py's summary step
+│   ├── summary_prompt.md          ← consumed by transcribe.py's summary step
+│   ├── translate_prompt.md        ← consumed by translate.py's first translation pass
+│   └── translate_fix_prompt.md    ← consumed by translate.py's automated fix-up
+│                                    pass on timecode-validation failure
 ├── docs/transcribe_instruction.md
-├── results/                 ← per-video output folders (gitignored; created on first run)
+├── results/                       ← per-video output folders (gitignored; created on first run)
 ├── README.md
 ├── AGENTS.md
 ├── CLAUDE.md
@@ -63,8 +66,9 @@ functional scripts. They use `{{placeholder}}` markers that scripts
 substitute with plain `str.replace()` (no Python format-string semantics),
 so user-supplied values are free to contain `{` and `}` without escaping.
 Scripts should resolve the prompts directory via a path derived from
-`__file__`, not from the current working directory — transcribe.py
-`chdir`s into its results folder before it ever reads a prompt.
+`__file__`, not from the current working directory — both functional
+scripts `chdir` into the per-video results folder before they ever read
+a prompt.
 
 ---
 
@@ -129,9 +133,16 @@ Re-running a script on the same input must be safe and cheap. Specifically:
   produce a primary output, detect the existing output and present the user
   with `[s]kip / [r]e-run / [c]hange` (or equivalent), never silently
   overwriting.
+- When a script produces a *set* of related downloads that should be
+  refreshed together (e.g. translate.py: one mp4 plus N per-language SRT
+  files), gate the entire phase up front with a `[p]roceed / [r]e-download`
+  prompt that lists what's already on disk. The `[r]edownload` path deletes
+  the bulky artifacts but preserves the small sidecars so the user's
+  previous choices are still offered as defaults.
 - Use **sidecar files** (small plain-text files alongside the main output)
-  to remember per-run choices (language, target language, model). This lets
-  the script offer "re-use last choice" without making the user remember.
+  to remember per-run choices (language, target language, model, video
+  quality). This lets the script offer "re-use last choice" without making
+  the user remember.
 
 ### 5.2 Preflight checks
 
@@ -167,12 +178,13 @@ Use suffixes to disambiguate purposes:
   `<ID>.translated.<src-slug>-to-<target-slug>.md`
 - Sidecars: `<ID>.<purpose>.txt` (e.g. `<ID>.lang.txt`,
   `<ID>.translate-source-lang.txt`, `<ID>.translate-target-lang.txt`,
-  `<ID>.summary-speaker.txt`, `<ID>.summary-context.txt`)
+  `<ID>.video-quality.txt`, `<ID>.summary-speaker.txt`,
+  `<ID>.summary-context.txt`)
 
 #### Per-video results folder
 
-`scripts/transcribe.py` groups all of one video's outputs under a
-**results folder**:
+Both `scripts/transcribe.py` and `scripts/translate.py` group all of one
+video's outputs under a **results folder**:
 
     <CWD>/results/<YYYY-MM-DD>_<video-title-slug>/
 
@@ -190,9 +202,8 @@ results-folder layout should call it then `os.chdir()` into the returned
 path before any other I/O, so the rest of the script can keep using
 CWD-relative filenames.
 
-`scripts/translate.py` currently writes to CWD directly (it doesn't use
-the results-folder layout yet). If you add a script that produces more
-than ~3 files for a single input, prefer the results-folder pattern.
+If you add a script that produces more than ~3 files for a single input,
+prefer the results-folder pattern.
 
 ### 5.5 Stdlib-only Python
 
@@ -224,12 +235,13 @@ sidecar files next to the outputs.
 
 Test outputs generated against real third-party videos (the `.mp4`, `.srt`,
 `.txt`, `.json`, `.tsv`, `.vtt`, `.dialogue.txt`, `.translated.*.md`,
-`.lang.txt`, `.translate-*.txt`, `.summary.md`, and `.summary-*.txt` files
-named by an 11-character YouTube ID — as well as the entire `results/`
-folder transcribe.py writes them into) are **not** committed to the repo.
-The current `.gitignore` already excludes the common extensions. When
-adding new output file types or top-level output directories, extend
-`.gitignore` in the same change.
+`.translated.*.broken.md`, `.lang.txt`, `.translate-*.txt`,
+`.video-quality.txt`, `.summary.md`, and `.summary-*.txt` files named by
+an 11-character YouTube ID — as well as the entire `results/` folder
+both functional scripts write them into) are **not** committed to the
+repo. `.gitignore` covers these extensions and the `results/` directory.
+When adding new output file types or top-level output directories,
+extend `.gitignore` in the same change.
 
 ### 5.9 Self-documenting scripts
 
@@ -289,9 +301,13 @@ part of the implementation, not a follow-up.
 
 - Helpers shared by both functional scripts: log functions, preflight checks
   (`check_yt_dlp`, `check_ffmpeg`, `check_claude`), YouTube URL prompt + ID
-  resolver + title fetch, `download_video` (720p, idempotent),
-  `download_subtitles_for_lang` (per-language SRT fetch, idempotent,
-  best-effort), `video_title_to_slug` + `find_or_create_results_dir`
+  resolver + title fetch, `get_video_metadata` (one-shot `yt-dlp -J`),
+  pure parsers `available_video_heights` / `available_subtitle_langs` over
+  that metadata, `download_video` (idempotent; accepts `max_height`,
+  defaults 720p), `download_subtitles_for_lang` (per-language SRT fetch,
+  idempotent, best-effort), `find_existing_artifacts` (returns the mp4
+  and the list of `<ID>.<lang>.srt` files in CWD — used by translate.py's
+  idempotency gate), `video_title_to_slug` + `find_or_create_results_dir`
   (per-video results folder), SRT timecode regex, `count_cue_blocks`.
 - Side-effect-free at import time. Do not add module-level `print`, `input`,
   or `sys.exit` calls.
@@ -329,28 +345,64 @@ part of the implementation, not a follow-up.
 
 ### `scripts/translate.py`
 
-- Translation path only — downloads the video and subtitles in a user-chosen
-  source language, then calls `claude -p` with a deterministic prompt that
-  preserves cue order and timecodes.
-- **Target language is restricted to English or Russian** by an explicit
-  two-option menu. If a future requirement re-opens this, update the
-  `prompt_target_language` function and the docstring at the same time.
-- **Source language is free-text** (any ISO-639-1 code). The user is
-  responsible for choosing a language that actually has subtitles available
-  on the video; if yt-dlp returns nothing, the script dies with a clear
-  message pointing to `scripts/transcribe.py` as the alternative.
-- The script refuses if source == target (nothing to translate).
+- Pipeline: resolve URL → fetch ID + title → `find_or_create_results_dir`
+  + `chdir` → idempotency gate (`[p]roceed / [r]e-download` if files
+  already on disk) → on a fresh / re-download run: `get_video_metadata` →
+  quality menu over `available_video_heights` → `download_video` at the
+  chosen height → loop `download_subtitles_for_lang` over every
+  base-code subtitle language → ask whether to translate → pick source
+  SRT → pick target (EN/RU/KK) → first-pass `claude -p` →
+  `validate_timecodes` → on validation failure, one automated fix-up
+  attempt with `prompts/translate_fix_prompt.md`.
+- All outputs land inside `results/<YYYY-MM-DD>_<slug>/`, resolved
+  by video ID, so re-running on a later day re-uses the same folder.
+- **Idempotency gate**: if `<ID>.mp4` already exists in the results
+  folder, the script lists what's there and asks
+  `[p]roceed / [r]e-download`. Proceed jumps straight to the
+  translation prompt. Re-download wipes the existing mp4 + per-language
+  SRTs but preserves sidecars (`.translate-*-lang.txt`,
+  `.video-quality.txt`) and any translation `.md` files, then runs the
+  full download flow.
+- **Quality menu**: heights are read from `yt-dlp -J`. Default is the
+  previous sidecar value if still on offer, else the highest <= 720p,
+  else the highest advertised height. Recorded in
+  `<ID>.video-quality.txt`.
+- **Subtitle downloads**: every advertised language is fetched (manual
+  subs + auto-generated captions), normalized to base ISO codes
+  (`en-US` → `en`). Each call is itself idempotent — re-runs that pick
+  `[p]roceed` only fetch what's missing.
+- **Target language is restricted to English, Russian, or Kazakh** by
+  an explicit three-option menu (`prompt_target_language`). To add
+  another target, extend that function, `_LANG_LABELS`, and
+  `canonical_lang_name` in the same edit.
+- **Source language is picked from the downloaded SRT files** via a
+  numbered menu (auto-skipped when only one SRT is on disk). The code is
+  parsed from the filename by `lang_from_srt_path`.
+- **Timecode validation is Python, not LLM-driven**. After each Claude
+  pass, `validate_timecodes(source_text, translated_text)` extracts
+  every `HH:MM:SS,mmm --> HH:MM:SS,mmm` range from both files and
+  compares them position-by-position. A non-empty issue list triggers
+  one fix-up attempt: the issues are embedded into
+  `prompts/translate_fix_prompt.md` (along with the original SRT and
+  the broken output) and `claude -p` is called again. If validation
+  still fails, the broken output is written to
+  `<ID>.translated.<src>-to-<tgt>.broken.md` and the script dies with
+  the issue list — never produces a `.md` file under the canonical name
+  with bad timecodes.
 - Outputs are namespaced by both languages:
-  `<ID>.translated.<src-slug>-to-<target-slug>.md`. Two sidecars
-  (`<ID>.translate-source-lang.txt`, `<ID>.translate-target-lang.txt`) let
-  the script offer "re-use both" on subsequent runs.
-- Single Claude call per translation (no chunking). The script warns if the
-  cue count in Claude's output is < 80% of the source — treat that as the
-  signal to revisit chunking for very long videos.
-- All language-related helpers (`lang_label`, `slug_lang`,
-  `canonical_lang_name`, `build_translate_prompt`, `translated_md_path`)
-  are pure functions designed for unit-testing. Keep them pure if you
-  change them.
+  `<ID>.translated.<src-slug>-to-<target-slug>.md`. Three sidecars
+  (`<ID>.translate-source-lang.txt`, `<ID>.translate-target-lang.txt`,
+  `<ID>.video-quality.txt`) let the script offer "re-use last" on
+  subsequent runs.
+- All language-related and prompt-construction helpers (`lang_label`,
+  `slug_lang`, `canonical_lang_name`, `normalize_subtitle_langs`,
+  `lang_from_srt_path`, `default_quality_choice`, `extract_timecodes`,
+  `validate_timecodes`, `build_translate_prompt`,
+  `build_translate_fix_prompt`, `translated_md_path`) are pure
+  functions designed for unit-testing. Keep them pure if you change
+  them. `build_translate_prompt` and `build_translate_fix_prompt` take
+  the template as a string argument so the file I/O stays out of the
+  pure layer.
 
 ### Adding a new functional script
 

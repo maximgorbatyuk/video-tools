@@ -216,3 +216,28 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# Project outputs (AGENTS.md § 5.8): never commit transcripts, translations,
+# downloaded videos, or any per-video artifact generated from third-party
+# YouTube content.
+# ---------------------------------------------------------------------------
+results/
+
+# Per-video downloads + transcripts (in case someone runs a script with CWD
+# pointing somewhere other than the repo root — these belong here too).
+*.mp4
+*.srt
+*.vtt
+*.tsv
+*.dialogue.txt
+*.translated.*.md
+*.summary.md
+
+# Per-video sidecars (small text files remembering language/quality choices).
+*.lang.txt
+*.translate-source-lang.txt
+*.translate-target-lang.txt
+*.video-quality.txt
+*.summary-speaker.txt
+*.summary-context.txt

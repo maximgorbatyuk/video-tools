@@ -11,7 +11,7 @@ local LLM, or any other downstream tool you like.
 > **Platform:** macOS on Apple Silicon (M-series). The transcription path
 > depends on `mlx_whisper`, which requires the MLX runtime and will not run
 > on Intel Macs, Linux, or Windows. The translation path is platform-neutral
-> but still expects `yt-dlp` and the `claude` CLI on `PATH`.
+> but still expects `yt-dlp`, `ffmpeg`, and the `claude` CLI on `PATH`.
 
 ---
 
@@ -19,15 +19,17 @@ local LLM, or any other downstream tool you like.
 
 ```
 video-tools/
-├── start.py                 ← interactive entrypoint (run this)
+├── start.py                       ← interactive entrypoint (run this)
 ├── scripts/
-│   ├── transcribe.py        ← functional script: transcribe with mlx_whisper (+ optional claude summary)
-│   ├── translate.py         ← functional script: download subs + translate via claude
-│   └── _common.py           ← shared helpers (not user-facing)
+│   ├── transcribe.py              ← functional script: transcribe with mlx_whisper (+ optional claude summary)
+│   ├── translate.py               ← functional script: download video + all subs, optionally translate via claude
+│   └── _common.py                 ← shared helpers (not user-facing)
 ├── prompts/
-│   └── summary_prompt.md    ← prompt template used by transcribe.py's summary step
+│   ├── summary_prompt.md          ← used by transcribe.py's summary step
+│   ├── translate_prompt.md        ← used by translate.py's first translation pass
+│   └── translate_fix_prompt.md    ← used by translate.py's automatic fix-up on timecode validation failure
 ├── docs/transcribe_instruction.md
-├── results/                 ← per-video output folders (gitignored; created on first run)
+├── results/                       ← per-video output folders (gitignored; created on first run)
 ├── README.md
 ├── AGENTS.md
 └── LICENSE
@@ -50,7 +52,7 @@ you want.
 | Script | Purpose | Host CLI deps |
 |---|---|---|
 | [`scripts/transcribe.py`](./scripts/transcribe.py) | Downloads a YouTube video at 720p, best-effort fetches its YouTube-hosted subtitles, and transcribes the audio locally with `mlx_whisper` + the `whisper-large-v3-turbo` model. All outputs land inside `results/<YYYY-MM-DD>_<video-slug>/`. At the end the script offers to summarize the transcript via `claude` using the template in [`prompts/summary_prompt.md`](./prompts/summary_prompt.md). | `yt-dlp`, `ffmpeg`, `mlx_whisper`, `claude` (only for the optional summary step) |
-| [`scripts/translate.py`](./scripts/translate.py) | Downloads a YouTube video at 720p plus subtitles in a user-chosen source language, then translates those subtitles to **English or Russian** via the `claude` CLI. Preserves every timecode and the meaning of each sentence; writes a side-by-side Markdown file. | `yt-dlp`, `ffmpeg`, `claude` |
+| [`scripts/translate.py`](./scripts/translate.py) | Downloads a YouTube video at a quality you pick (only the resolutions YouTube actually serves are offered) plus every subtitle language the platform advertises. Then optionally translates one of those subtitle files to **English, Russian, or Kazakh** via the `claude` CLI. Timecodes are validated in Python after each Claude pass — if any drift, the script asks Claude to redo the translation once before giving up. All outputs land inside `results/<YYYY-MM-DD>_<video-slug>/`. Re-running on a video whose files are already on disk gates with `[p]roceed / [r]e-download`. | `yt-dlp`, `ffmpeg`, `claude` |
 
 ### Reference docs
 
@@ -107,7 +109,7 @@ You'll be asked which script to run:
 
 What do you want to do?
   [1] Transcribe a YouTube video (mlx_whisper, runs locally)
-  [2] Translate YouTube subtitles to English or Russian (claude)
+  [2] Download video + subtitles, optionally translate to EN/RU/KK (claude)
 
 Pick 1/2:
 ```
@@ -158,23 +160,34 @@ date).
 
 ### `scripts/translate.py`
 
-Outputs land in the current working directory (one flat layout per CWD).
+Outputs are grouped per video under `results/<YYYY-MM-DD>_<title-slug>/`,
+the same layout as `transcribe.py`. The date prefix is the date of the
+*first* run for that video — re-runs re-use the same folder.
 
-| File | Notes |
-|---|---|
-| `<ID>.mp4` | 720p video download (idempotent — skipped if present) |
-| `<ID>.<src-lang>.srt` | Source subtitles from YouTube (e.g. `<ID>.en.srt`, `<ID>.zh.srt`) |
-| `<ID>.translated.<src-slug>-to-<target-slug>.md` | Side-by-side translation, one cue per block (e.g. `<ID>.translated.zh-to-russian.md`) |
-| `<ID>.translate-source-lang.txt` | Sidecar: source language used last time |
-| `<ID>.translate-target-lang.txt` | Sidecar: target language used last time |
+```
+<CWD>/results/2026-05-24_some_video_title/
+├── <ID>.mp4                                  ← video at the chosen quality
+├── <ID>.<lang>.srt                           ← one file per advertised subtitle language
+├── <ID>.translated.<src>-to-<tgt>.md         ← side-by-side translation (only after a successful run)
+├── <ID>.translated.<src>-to-<tgt>.broken.md  ← (only if Claude failed timecode validation)
+├── <ID>.video-quality.txt                    ← sidecar: last chosen download height
+├── <ID>.translate-source-lang.txt            ← sidecar: source language used last time
+└── <ID>.translate-target-lang.txt            ← sidecar: target language used last time
+```
 
 ### Idempotency
 
-Re-running either script on the same URL is safe — heavy steps (video
+Re-running either script on the same URL is safe. Heavy steps (video
 download, subtitle download, transcription, translation, summary) are
 skipped or gated behind a `[s]kip / [r]e-run / [c]hange` prompt. The
 per-purpose sidecars let each script offer "re-use last choice"
 automatically.
+
+`translate.py` additionally prompts up front if a previous run's video
++ subtitles are already on disk — you can `[p]roceed` straight to
+translation using the existing files, or `[r]e-download` everything from
+scratch in one go. The redownload path preserves sidecars and any
+previously-completed translation `.md` files.
 
 ## License
 
