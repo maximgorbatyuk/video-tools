@@ -241,3 +241,4 @@ results/
 *.video-quality.txt
 *.summary-speaker.txt
 *.summary-context.txt
+.DS_Store

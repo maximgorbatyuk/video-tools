@@ -4,7 +4,8 @@ Shared helpers for the functional scripts in this folder.
 This module is NOT a runnable script and is not registered in start.py.
 It exposes:
 
-    Log helpers:    info / ok / warn / err / die
+    Log helpers:    info / ok / warn / err / die / debug
+    Verbose mode:   set_verbose, is_verbose, time_block
     Preflight:      check_yt_dlp, check_ffmpeg, check_claude
     YouTube:        YOUTUBE_ID_RE, prompt_youtube_url, get_video_id,
                     get_video_title, get_video_metadata,
@@ -25,9 +26,11 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 
 # ----------------------------------------------------------------------------
@@ -56,6 +59,54 @@ def die(msg: str, hint: Optional[str] = None) -> "None":
         print()
         print(hint)
     sys.exit(1)
+
+
+# ----------------------------------------------------------------------------
+# Verbose / debug logging
+# ----------------------------------------------------------------------------
+#
+# Off by default. Scripts call set_verbose(True) from their argparse handler
+# when `-v` / `--verbose` is passed. debug() is a no-op when off, so it's
+# safe to sprinkle liberally at hot points (claude calls, yt-dlp shells,
+# validation passes) without polluting the normal output.
+
+_VERBOSE = False
+
+
+def set_verbose(enabled: bool) -> None:
+    """Enable or disable debug-level logging globally for this process."""
+    global _VERBOSE
+    _VERBOSE = bool(enabled)
+
+
+def is_verbose() -> bool:
+    return _VERBOSE
+
+
+def debug(msg: str) -> None:
+    """Dim-colored diagnostic line. Silent unless set_verbose(True) was called."""
+    if not _VERBOSE:
+        return
+    print(f"\033[90m[d]\033[0m {msg}", file=sys.stderr)
+
+
+@contextmanager
+def time_block(label: str) -> Iterator[None]:
+    """
+    Context manager that emits a `start` + `done in Xs` pair at debug level.
+
+    No-op (still yields) when verbose is off, so wrapping a slow call with
+    this is free in the common case.
+    """
+    if not _VERBOSE:
+        yield
+        return
+    debug(f"{label}: start")
+    t0 = time.monotonic()
+    try:
+        yield
+    finally:
+        debug(f"{label}: done in {time.monotonic() - t0:.2f}s")
 
 
 # ----------------------------------------------------------------------------
@@ -162,23 +213,32 @@ def get_video_metadata(url: str) -> dict:
     One round-trip (~1–2s). Callers use the result to enumerate available
     video heights and subtitle languages without further yt-dlp invocations.
     """
+    debug(f"yt-dlp -J: fetching metadata for {url}")
     try:
-        result = subprocess.run(
-            ["yt-dlp", "-J", "--no-warnings", url],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        with time_block("yt-dlp -J"):
+            result = subprocess.run(
+                ["yt-dlp", "-J", "--no-warnings", url],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
     except subprocess.CalledProcessError as e:
         die(
             "yt-dlp failed to fetch video metadata.",
             f"yt-dlp stderr:\n{e.stderr}",
         )
     try:
-        return json.loads(result.stdout)
+        metadata = json.loads(result.stdout)
     except json.JSONDecodeError as e:
         die(f"yt-dlp returned invalid JSON metadata: {e}")
-    return {}  # unreachable; die() exits — keeps the type-checker happy
+        return {}  # unreachable; for the type-checker
+    debug(
+        f"yt-dlp returned {len(result.stdout)} chars of JSON; "
+        f"{len(metadata.get('formats') or [])} formats, "
+        f"{len(metadata.get('subtitles') or {})} manual sub langs, "
+        f"{len(metadata.get('automatic_captions') or {})} auto sub langs"
+    )
+    return metadata
 
 
 def available_video_heights(metadata: dict) -> list[int]:
@@ -235,8 +295,10 @@ def download_video(url: str, video_id: str, max_height: int = 720) -> Path:
         "-o", f"{video_id}.%(ext)s",
         url,
     ]
+    debug(f"yt-dlp argv: {cmd}")
     try:
-        subprocess.run(cmd, check=True)
+        with time_block("yt-dlp download"):
+            subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError:
         die("yt-dlp failed to download the video.")
 
@@ -246,6 +308,11 @@ def download_video(url: str, video_id: str, max_height: int = 720) -> Path:
             "Check yt-dlp's output above — the available format may have "
             "produced a different container.",
         )
+    try:
+        size_mb = out_path.stat().st_size / 1024 / 1024
+        debug(f"{out_path.name}: {size_mb:.1f} MB on disk")
+    except OSError:
+        pass
     return out_path
 
 
@@ -281,8 +348,13 @@ def download_subtitles_for_lang(
         "-o", f"{video_id}.%(ext)s",
         url,
     ]
+    debug(f"yt-dlp argv: {cmd}")
     try:
-        subprocess.run(cmd, check=False, capture_output=True, text=True)
+        with time_block(f"yt-dlp subs ({source_lang})"):
+            result = subprocess.run(
+                cmd, check=False, capture_output=True, text=True,
+            )
+        debug(f"yt-dlp subs exit: {result.returncode}")
     except Exception as e:  # pragma: no cover — extremely unlikely
         warn(f"yt-dlp subtitles fetch raised an exception: {e}")
         return None
@@ -291,11 +363,17 @@ def download_subtitles_for_lang(
     # `<ID>.<lang>-US.srt`, etc. — pick the first match.
     candidates = sorted(Path(".").glob(f"{video_id}.{source_lang}*.srt"))
     if not candidates:
+        debug(f"no {source_lang} subtitle file produced")
         return None
 
     chosen = candidates[0]
     if chosen != out_path:
         chosen.rename(out_path)
+    try:
+        size_kb = out_path.stat().st_size / 1024
+        debug(f"{out_path.name}: {size_kb:.1f} KB")
+    except OSError:
+        pass
     ok(f"saved {source_lang} subtitles: {out_path}")
     return out_path
 

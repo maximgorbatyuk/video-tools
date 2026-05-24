@@ -12,7 +12,12 @@ to it as a subprocess. Each functional script is independently runnable
 door for users who don't yet know which script they want.
 
 Usage:
-    python3 start.py
+    python3 start.py [-v|--verbose]
+
+The `-v` / `--verbose` flag is forwarded to the dispatched script so it
+prints dim `[d]` diagnostic lines (yt-dlp argv, claude prompt sizes,
+call durations, etc.) to stderr. The env var `VIDEO_TOOLS_VERBOSE=1` is
+an equivalent way to enable it for the whole shell session.
 
 Add a new functional script:
     1. Drop it into `scripts/` (e.g. `scripts/summarize.py`).
@@ -23,6 +28,8 @@ Add a new functional script:
 
 from __future__ import annotations
 
+import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -36,7 +43,29 @@ SCRIPTS: list[tuple[str, str, str]] = [
 ]
 
 
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="start.py",
+        description=(
+            "Interactive menu for the video-tools repo. Forwards -v/--verbose "
+            "to the dispatched functional script."
+        ),
+    )
+    p.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help=(
+            "Forward --verbose to the dispatched script (or set "
+            "VIDEO_TOOLS_VERBOSE=1 in the environment)."
+        ),
+    )
+    return p.parse_args(argv)
+
+
 def main() -> int:
+    args = _parse_args()
+    verbose = args.verbose or os.environ.get("VIDEO_TOOLS_VERBOSE", "").strip() not in ("", "0", "false", "False")
+
     print("=== video-tools ===\n")
     print("What do you want to do?")
     for key, label, _ in SCRIPTS:
@@ -56,8 +85,11 @@ def main() -> int:
         print(f"error: expected script not found at {target}", file=sys.stderr)
         return 1
 
+    cmd = [sys.executable, str(target)]
+    if verbose:
+        cmd.append("--verbose")
     print()
-    result = subprocess.run([sys.executable, str(target)])
+    result = subprocess.run(cmd)
     return result.returncode
 
 

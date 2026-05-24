@@ -39,9 +39,14 @@ cached at  ~/.cache/huggingface/hub/  for subsequent runs.
 ------------------------------------------------------------------------
 Usage
 ------------------------------------------------------------------------
-    python3 scripts/transcribe.py
+    python3 scripts/transcribe.py [-v|--verbose]
         or
-    python3 start.py   (then pick option 1)
+    python3 start.py [-v|--verbose]   (then pick option 1)
+
+The `-v` / `--verbose` flag prints dim `[d]` diagnostic lines to stderr —
+yt-dlp argv, mlx_whisper duration, paragraph-split stats, claude prompt
+char counts, and claude call durations. Use it to diagnose hangs or
+unexpected failures.
 
 The script is fully interactive. The algorithm is:
 
@@ -124,6 +129,7 @@ Limitations
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import shutil
@@ -140,6 +146,7 @@ from _common import (  # noqa: E402
     check_claude,
     check_ffmpeg,
     check_yt_dlp,
+    debug,
     die,
     download_subtitles_for_lang,
     download_video,
@@ -147,8 +154,11 @@ from _common import (  # noqa: E402
     get_video_id,
     get_video_title,
     info,
+    is_verbose,
     ok,
     prompt_youtube_url,
+    set_verbose,
+    time_block,
     warn,
 )
 
@@ -315,9 +325,11 @@ def run_mlx_whisper(video_path: Path, video_id: str, language: Optional[str]) ->
     ]
     if language:
         cmd += ["--language", language]
+    debug(f"mlx_whisper argv: {cmd}")
 
     try:
-        subprocess.run(cmd, check=True)
+        with time_block("mlx_whisper"):
+            subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError:
         die("mlx_whisper failed.")
 
@@ -381,6 +393,7 @@ def write_dialogue_txt(video_id: str) -> None:
         return
 
     segments = parse_srt(srt_path)
+    debug(f"parsed {len(segments)} SRT segments from {srt_path.name}")
     if not segments:
         warn(f"{srt_path} contained no usable segments")
         return
@@ -524,20 +537,28 @@ def build_summary_prompt(template: str, speaker: str, context: str, transcript: 
 
 
 def run_claude(prompt: str) -> str:
-    """Call `claude -p <prompt>` and return stdout."""
+    """Call `claude -p` with the prompt piped via stdin and return stdout.
+
+    Piping rather than passing the prompt as argv keeps us well under the
+    ~1 MB ARG_MAX limit on macOS — long transcripts can easily exceed that.
+    """
     info("invoking claude CLI (this may take a minute for longer transcripts)…")
+    debug(f"claude prompt: {len(prompt)} chars (~{len(prompt.encode('utf-8')) / 1024:.1f} KB)")
     try:
-        result = subprocess.run(
-            ["claude", "-p", prompt],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        with time_block("claude -p"):
+            result = subprocess.run(
+                ["claude", "-p"],
+                input=prompt,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
     except subprocess.CalledProcessError as e:
         die(
             "`claude` CLI returned a non-zero exit code.",
             f"stderr:\n{e.stderr}",
         )
+    debug(f"claude response: {len(result.stdout)} chars")
     return result.stdout
 
 
@@ -594,8 +615,32 @@ def maybe_summarize(video_id: str) -> None:
 # Main
 # ----------------------------------------------------------------------------
 
+def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="transcribe.py",
+        description=(
+            "Download a YouTube video at 720p, transcribe its audio locally "
+            "with mlx_whisper, and optionally summarize with claude."
+        ),
+    )
+    p.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help=(
+            "Print dim [d] diagnostic lines to stderr (yt-dlp / mlx_whisper "
+            "argv + durations, claude prompt sizes, SRT segment counts)."
+        ),
+    )
+    return p.parse_args(argv)
+
+
 def main() -> int:
+    args = _parse_args()
+    set_verbose(args.verbose)
+
     print("=== YouTube → mlx_whisper transcription ===\n")
+    if is_verbose():
+        debug("verbose mode enabled")
 
     info("Preflight checks…")
     check_yt_dlp()
@@ -614,6 +659,7 @@ def main() -> int:
     results_dir = find_or_create_results_dir(video_id, title)
     info(f"results folder: {results_dir.resolve()}")
     os.chdir(results_dir)
+    debug(f"chdir → {results_dir.resolve()}")
 
     video_path = download_video(url, video_id)
 

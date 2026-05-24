@@ -5,8 +5,8 @@ on a local Apple Silicon Mac — no cloud transcription, no third-party API
 billing for the heavy lifting.
 
 The intended workflow: take a YouTube URL, end up with a clean transcript (or
-a side-by-side translation) on disk that you can then paste into LM Studio, a
-local LLM, or any other downstream tool you like.
+a translated `.srt` subtitle file) on disk that you can then paste into LM
+Studio, a local LLM, or any other downstream tool you like.
 
 > **Platform:** macOS on Apple Silicon (M-series). The transcription path
 > depends on `mlx_whisper`, which requires the MLX runtime and will not run
@@ -52,7 +52,7 @@ you want.
 | Script | Purpose | Host CLI deps |
 |---|---|---|
 | [`scripts/transcribe.py`](./scripts/transcribe.py) | Downloads a YouTube video at 720p, best-effort fetches its YouTube-hosted subtitles, and transcribes the audio locally with `mlx_whisper` + the `whisper-large-v3-turbo` model. All outputs land inside `results/<YYYY-MM-DD>_<video-slug>/`. At the end the script offers to summarize the transcript via `claude` using the template in [`prompts/summary_prompt.md`](./prompts/summary_prompt.md). | `yt-dlp`, `ffmpeg`, `mlx_whisper`, `claude` (only for the optional summary step) |
-| [`scripts/translate.py`](./scripts/translate.py) | Downloads a YouTube video at a quality you pick (only the resolutions YouTube actually serves are offered) plus every subtitle language the platform advertises. Then optionally translates one of those subtitle files to **English, Russian, or Kazakh** via the `claude` CLI. Timecodes are validated in Python after each Claude pass — if any drift, the script asks Claude to redo the translation once before giving up. All outputs land inside `results/<YYYY-MM-DD>_<video-slug>/`. Re-running on a video whose files are already on disk gates with `[p]roceed / [r]e-download`. | `yt-dlp`, `ffmpeg`, `claude` |
+| [`scripts/translate.py`](./scripts/translate.py) | Downloads a YouTube video at a quality you pick (only the resolutions YouTube actually serves are offered) plus every subtitle language the platform advertises. Then optionally translates one of those subtitle files to **English, Russian, or Kazakh** via the `claude` CLI and writes the result as a plain `.srt` file (`<ID>.translated.<tgt>.srt`). Timecodes are validated in Python after each Claude pass — if any drift, the script asks Claude to redo the translation once before giving up. All outputs land inside `results/<YYYY-MM-DD>_<video-slug>/`. Re-running on a video whose files are already on disk gates with `[p]roceed / [r]e-download`. | `yt-dlp`, `ffmpeg`, `claude` |
 
 ### Reference docs
 
@@ -129,6 +129,24 @@ python3 /path/to/video-tools/scripts/translate.py
 Both scripts are independently runnable — `start.py` is just a friendlier
 front door.
 
+### Verbose diagnostic logs
+
+Pass `-v` / `--verbose` to any entrypoint to enable dim `[d]` diagnostic
+lines on stderr — yt-dlp argv, claude prompt sizes, claude call durations,
+mlx_whisper duration, validator cue counts, and the first few
+timecode-validation issues. Use it to diagnose hangs or unexpected
+failures.
+
+```bash
+python3 start.py -v
+python3 scripts/translate.py --verbose
+python3 scripts/transcribe.py --verbose
+```
+
+The env var `VIDEO_TOOLS_VERBOSE=1` is an equivalent way to turn verbose
+mode on when launching via `start.py` (the functional scripts themselves
+take the flag directly).
+
 ---
 
 ## Output layout
@@ -166,13 +184,13 @@ the same layout as `transcribe.py`. The date prefix is the date of the
 
 ```
 <CWD>/results/2026-05-24_some_video_title/
-├── <ID>.mp4                                  ← video at the chosen quality
-├── <ID>.<lang>.srt                           ← one file per advertised subtitle language
-├── <ID>.translated.<src>-to-<tgt>.md         ← side-by-side translation (only after a successful run)
-├── <ID>.translated.<src>-to-<tgt>.broken.md  ← (only if Claude failed timecode validation)
-├── <ID>.video-quality.txt                    ← sidecar: last chosen download height
-├── <ID>.translate-source-lang.txt            ← sidecar: source language used last time
-└── <ID>.translate-target-lang.txt            ← sidecar: target language used last time
+├── <ID>.mp4                            ← video at the chosen quality
+├── <ID>.<lang>.srt                     ← one file per advertised subtitle language
+├── <ID>.translated.<tgt>.srt           ← translated subtitles, plain .srt ready for any player (e.g. .translated.ru.srt)
+├── <ID>.translated.<tgt>.broken.srt    ← (only if Claude failed timecode validation; kept for inspection)
+├── <ID>.video-quality.txt              ← sidecar: last chosen download height
+├── <ID>.translate-source-lang.txt      ← sidecar: source language used last time
+└── <ID>.translate-target-lang.txt      ← sidecar: target language used last time
 ```
 
 ### Idempotency
@@ -187,7 +205,7 @@ automatically.
 + subtitles are already on disk — you can `[p]roceed` straight to
 translation using the existing files, or `[r]e-download` everything from
 scratch in one go. The redownload path preserves sidecars and any
-previously-completed translation `.md` files.
+previously-completed `<ID>.translated.<tgt>.srt` files.
 
 ## License
 

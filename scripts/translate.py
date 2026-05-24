@@ -6,8 +6,9 @@ scripts/translate.py
 Interactive command-line tool that downloads a YouTube video and every
 subtitle language YouTube advertises for it, then optionally translates
 one of those subtitle files into English, Russian, or Kazakh via the
-`claude` CLI — preserving every timecode and validating the result with
-Python before declaring success.
+`claude` CLI — preserving every timecode, validating the result with
+Python, and writing the output as a plain SubRip (.srt) file ready for
+playback.
 
 This script is one of the functional scripts in this repo. It can be
 launched from the top-level menu via `python3 start.py` or run directly
@@ -33,9 +34,14 @@ Prerequisites (all must be on PATH)
 ------------------------------------------------------------------------
 Usage
 ------------------------------------------------------------------------
-    python3 scripts/translate.py
+    python3 scripts/translate.py [-v|--verbose]
         or
-    python3 start.py   (then pick option 2)
+    python3 start.py [-v|--verbose]   (then pick option 2)
+
+The `-v` / `--verbose` flag prints dim `[d]` diagnostic lines to stderr —
+yt-dlp argv, claude prompt char counts, claude call durations, validator
+cue counts, the first few timecode-validation issues, and output file
+sizes. Use it to diagnose hangs or unexpected failures.
 
 The script is fully interactive. Algorithm:
 
@@ -74,15 +80,19 @@ The script is fully interactive. Algorithm:
          - Ask for the target language: [e]nglish / [r]ussian /
            [k]azakh. Refuse source == target.
          - Substitute into `prompts/translate_prompt.md` and call
-           `claude -p`.
+           `claude -p`. The prompt asks Claude to emit a valid SubRip
+           (.srt) document in the target language with the original
+           cue numbers and timecodes preserved verbatim.
          - Run `validate_timecodes()` (pure Python) over claude's
            response. If every timecode matches the source, write the
-           side-by-side Markdown file.
+           result to `<ID>.translated.<tgt>.srt`.
          - If the validator finds inconsistencies, retry once with
            `prompts/translate_fix_prompt.md` — the new prompt embeds
            the list of mismatched cues. Validate again. If still
-           inconsistent, die with a clear error pointing to the broken
-           output and the issue list.
+           inconsistent, write the bad attempt to
+           `<ID>.translated.<tgt>.broken.srt` and die with the issue
+           list — the canonical filename is never written with bad
+           timecodes.
 
 ------------------------------------------------------------------------
 Outputs (all written into the per-video results folder)
@@ -96,12 +106,17 @@ Outputs (all written into the per-video results folder)
             advertised language. Manual subs preferred, auto-generated
             fall back to the same filename.
 
-        <ID>.translated.<src-slug>-to-<target-slug>.md
-            Side-by-side translation, one cue per block:
+        <ID>.translated.<tgt>.srt
+            The translated subtitles as a valid SubRip (.srt) file in
+            the target language. `<tgt>` is the lowercased 2-letter
+            code (e.g. `ru`, `en`, `kk`). The file is ready to load
+            into any video player that accepts SRT.
 
-                [HH:MM:SS,mmm --> HH:MM:SS,mmm]
-                <SRC>: <original line>
-                <TGT>: <fluent translation>
+        <ID>.translated.<tgt>.broken.srt
+            Written only when Claude couldn't produce a timecode-
+            consistent translation after the automated fix-up attempt.
+            Kept on disk for inspection so you can salvage parts of
+            the translation by hand.
 
         <ID>.video-quality.txt
             Sidecar remembering the last chosen download height.
@@ -121,7 +136,7 @@ Idempotency
       before any network I/O.
     * Individual subtitle downloads skip if `<ID>.<lang>.srt` already
       exists.
-    * `<ID>.translated.<src>-to-<tgt>.md` already exists → asks
+    * `<ID>.translated.<tgt>.srt` already exists → asks
       `[s]kip / [r]e-run with same / [c]hange target language`.
     * Sidecars (`.translate-*-lang.txt`, `.video-quality.txt`) are
       offered as defaults on subsequent runs.
@@ -140,6 +155,7 @@ Limitations
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import subprocess
@@ -156,6 +172,7 @@ from _common import (  # noqa: E402
     check_claude,
     check_ffmpeg,
     check_yt_dlp,
+    debug,
     die,
     download_subtitles_for_lang,
     download_video,
@@ -165,8 +182,11 @@ from _common import (  # noqa: E402
     get_video_metadata,
     get_video_title,
     info,
+    is_verbose,
     ok,
     prompt_youtube_url,
+    set_verbose,
+    time_block,
     warn,
 )
 
@@ -190,7 +210,8 @@ MAX_FIXUP_RETRIES = 1
 # Language helpers (label + slug + canonical name) — pure, unit-testable
 # ----------------------------------------------------------------------------
 
-# Map common language strings → short label used in the side-by-side output.
+# Map common language strings → 2-letter code used in output filenames
+# (`<ID>.translated.<code>.srt`).
 _LANG_LABELS = {
     "ru": "RU", "russian": "RU", "русский": "RU",
     "en": "EN", "english": "EN",
@@ -213,7 +234,7 @@ _LANG_LABELS = {
 
 
 def lang_label(language: str) -> str:
-    """Short 2-letter-ish label for the side-by-side output (e.g. 'RU')."""
+    """Short 2-letter-ish code (e.g. 'RU') used in output filenames."""
     s = language.strip().lower()
     if s in _LANG_LABELS:
         return _LANG_LABELS[s]
@@ -507,16 +528,24 @@ def prompt_yes_no(question: str, default_no: bool = True) -> bool:
 # Translation output path + retranslate prompt
 # ----------------------------------------------------------------------------
 
-def translated_md_path(video_id: str, source_lang: str, target_lang: str) -> Path:
-    return Path(
-        f"{video_id}.translated."
-        f"{slug_lang(source_lang)}-to-{slug_lang(target_lang)}.md"
-    )
+def _target_code(target_lang: str) -> str:
+    """Lowercased 2-letter code used in output filenames (e.g. 'ru', 'en')."""
+    return lang_label(target_lang).lower()
+
+
+def translated_srt_path(video_id: str, target_lang: str) -> Path:
+    """Canonical translated-subtitles output, e.g. `<ID>.translated.ru.srt`."""
+    return Path(f"{video_id}.translated.{_target_code(target_lang)}.srt")
+
+
+def broken_translated_srt_path(video_id: str, target_lang: str) -> Path:
+    """Path used to persist a translation that failed timecode validation."""
+    return Path(f"{video_id}.translated.{_target_code(target_lang)}.broken.srt")
 
 
 def prompt_retranslate(video_id: str, source_lang: str, target_lang: str) -> str:
     """Returns 'skip', 'same', or 'change'."""
-    out = translated_md_path(video_id, source_lang, target_lang)
+    out = translated_srt_path(video_id, target_lang)
     print()
     info(f"translation already exists: {out}")
     while True:
@@ -601,17 +630,13 @@ def build_translate_prompt(
     template: str,
     source_lang: str,
     target_lang: str,
-    src_label: str,
-    tgt_label: str,
     srt_text: str,
 ) -> str:
-    """Substitute the five placeholders into the first-pass translate prompt."""
+    """Substitute the three placeholders into the first-pass translate prompt."""
     return (
         template
         .replace("{{source_lang}}", source_lang)
         .replace("{{target_lang}}", target_lang)
-        .replace("{{src_label}}", src_label)
-        .replace("{{tgt_label}}", tgt_label)
         .replace("{{srt_text}}", srt_text)
     )
 
@@ -621,8 +646,6 @@ def build_translate_fix_prompt(
     video_id: str,
     source_lang: str,
     target_lang: str,
-    src_label: str,
-    tgt_label: str,
     original_srt: str,
     broken_translation: str,
     timecode_issues: str,
@@ -633,8 +656,6 @@ def build_translate_fix_prompt(
         .replace("{{video_id}}", video_id)
         .replace("{{source_lang}}", source_lang)
         .replace("{{target_lang}}", target_lang)
-        .replace("{{src_label}}", src_label)
-        .replace("{{tgt_label}}", tgt_label)
         .replace("{{original_srt}}", original_srt)
         .replace("{{broken_translation}}", broken_translation)
         .replace("{{timecode_issues}}", timecode_issues)
@@ -642,24 +663,53 @@ def build_translate_fix_prompt(
 
 
 # ----------------------------------------------------------------------------
+# Verbose-mode validation summary helper
+# ----------------------------------------------------------------------------
+
+def _debug_validation_summary(
+    source_text: str, translated_text: str, issues: list[str]
+) -> None:
+    """Emit cue counts + a preview of the first few issues at debug level."""
+    if not is_verbose():
+        return
+    src_n = len(extract_timecodes(source_text))
+    tgt_n = len(extract_timecodes(translated_text))
+    debug(f"validator: source has {src_n} cues, translation has {tgt_n} cues")
+    debug(f"validator: {len(issues)} issue(s) total")
+    for line in issues[:5]:
+        debug(f"  • {line}")
+    if len(issues) > 5:
+        debug(f"  …and {len(issues) - 5} more")
+
+
+# ----------------------------------------------------------------------------
 # Claude invocation
 # ----------------------------------------------------------------------------
 
 def run_claude(prompt: str) -> str:
-    """Call `claude -p <prompt>` and return stdout."""
+    """Call `claude -p` with the prompt piped via stdin and return stdout.
+
+    Piping rather than passing the prompt as argv keeps us well under the
+    ~1 MB ARG_MAX limit on macOS — the fix-up prompt can easily exceed
+    that for long videos with many failing cues.
+    """
     info("invoking claude CLI (this may take a minute for longer videos)…")
+    debug(f"claude prompt: {len(prompt)} chars (~{len(prompt.encode('utf-8')) / 1024:.1f} KB)")
     try:
-        result = subprocess.run(
-            ["claude", "-p", prompt],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        with time_block("claude -p"):
+            result = subprocess.run(
+                ["claude", "-p"],
+                input=prompt,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
     except subprocess.CalledProcessError as e:
         die(
             "`claude` CLI returned a non-zero exit code.",
             f"stderr:\n{e.stderr}",
         )
+    debug(f"claude response: {len(result.stdout)} chars")
     return result.stdout
 
 
@@ -673,9 +723,9 @@ def translate_subtitles(
     source_lang: str,
     target_lang: str,
 ) -> None:
-    """First pass + validated retry. Writes the .md on success, dies on
+    """First pass + validated retry. Writes the .srt on success, dies on
     final failure."""
-    out_path = translated_md_path(video_id, source_lang, target_lang)
+    out_path = translated_srt_path(video_id, target_lang)
     if out_path.exists():
         choice = prompt_retranslate(video_id, source_lang, target_lang)
         if choice == "skip":
@@ -683,7 +733,7 @@ def translate_subtitles(
             return
         if choice == "change":
             target_lang = prompt_target_language()
-            out_path = translated_md_path(video_id, source_lang, target_lang)
+            out_path = translated_srt_path(video_id, target_lang)
             if slug_lang(source_lang) == slug_lang(target_lang):
                 die(
                     f"Source and target language are the same "
@@ -702,21 +752,25 @@ def translate_subtitles(
             "the repo.",
         )
 
-    src_label = lang_label(source_lang)
-    tgt_label = lang_label(target_lang)
     source_name = canonical_lang_name(source_lang)
     target_name = canonical_lang_name(target_lang)
+    debug(
+        f"translating {srt_path.name}: "
+        f"{source_name} → {target_name} "
+        f"({len(srt_text)} chars source SRT)"
+    )
 
     # ---------- First pass --------------------------------------------------
     template = TRANSLATE_PROMPT_TEMPLATE.read_text(encoding="utf-8")
     prompt = build_translate_prompt(
-        template, source_name, target_name, src_label, tgt_label, srt_text,
+        template, source_name, target_name, srt_text,
     )
     output = run_claude(prompt).strip()
     if not output:
         die("claude returned an empty response on the first translation pass.")
 
     issues = validate_timecodes(srt_text, output)
+    _debug_validation_summary(srt_text, output, issues)
 
     # ---------- Optional fix-up attempts -----------------------------------
     if issues:
@@ -741,8 +795,6 @@ def translate_subtitles(
                 video_id=video_id,
                 source_lang=source_name,
                 target_lang=target_name,
-                src_label=src_label,
-                tgt_label=tgt_label,
                 original_srt=srt_text,
                 broken_translation=output,
                 timecode_issues=issues_block,
@@ -750,12 +802,14 @@ def translate_subtitles(
             info(
                 f"fix-up attempt {attempt + 1} of {MAX_FIXUP_RETRIES}…"
             )
+            debug(f"fix-up issues block: {len(issues_block)} chars")
             output = run_claude(fix_prompt).strip()
             if not output:
                 die(
                     "claude returned an empty response on the fix-up pass.",
                 )
             issues = validate_timecodes(srt_text, output)
+            _debug_validation_summary(srt_text, output, issues)
             if not issues:
                 ok(
                     f"timecode validation passed on fix-up attempt "
@@ -765,10 +819,7 @@ def translate_subtitles(
         else:
             # All retries exhausted with issues still present.
             # Persist the broken output for inspection, then die.
-            broken_path = Path(
-                f"{video_id}.translated."
-                f"{slug_lang(source_lang)}-to-{slug_lang(target_lang)}.broken.md"
-            )
+            broken_path = broken_translated_srt_path(video_id, target_lang)
             broken_path.write_text(output + "\n", encoding="utf-8")
             preview = "\n".join(issues[:10])
             more = (
@@ -785,19 +836,15 @@ def translate_subtitles(
     else:
         ok("timecode validation passed on the first pass.")
 
-    # ---------- Write the side-by-side file --------------------------------
-    header = (
-        f"# Subtitle translation — {video_id}\n\n"
-        f"Source: `{srt_path.name}` ({source_name})  ·  "
-        f"Target language: **{target_name}**\n\n"
-        f"Each block shows the original timecode, the {source_name} line, "
-        f"and a {target_name} rendering of the same line.\n\n"
-        f"Timecode integrity verified by Python against the source SRT.\n\n"
-        f"---\n\n"
-    )
-    out_path.write_text(header + output + "\n", encoding="utf-8")
+    # ---------- Write the translated SRT ----------------------------------
+    out_path.write_text(output.rstrip() + "\n", encoding="utf-8")
     write_sidecar(source_lang_sidecar(video_id), source_lang)
     write_sidecar(target_lang_sidecar(video_id), target_lang)
+    try:
+        size_kb = out_path.stat().st_size / 1024
+        debug(f"{out_path.name}: {size_kb:.1f} KB written")
+    except OSError:
+        pass
     ok(f"wrote {out_path}")
 
 
@@ -836,8 +883,34 @@ def maybe_translate(video_id: str, video_path: Path) -> None:
     translate_subtitles(srt_path, video_id, source_lang, target_lang)
 
 
+def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="translate.py",
+        description=(
+            "Download a YouTube video + every advertised subtitle language, "
+            "then optionally translate one of those subtitles into EN/RU/KK "
+            "via claude."
+        ),
+    )
+    p.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help=(
+            "Print dim [d] diagnostic lines to stderr (yt-dlp argv, claude "
+            "prompt sizes, claude durations, validator cue counts, first "
+            "few timecode issues, output file sizes)."
+        ),
+    )
+    return p.parse_args(argv)
+
+
 def main() -> int:
+    args = _parse_args()
+    set_verbose(args.verbose)
+
     print("=== YouTube downloader + claude translation ===\n")
+    if is_verbose():
+        debug("verbose mode enabled")
 
     info("Preflight checks…")
     check_yt_dlp()
@@ -855,12 +928,18 @@ def main() -> int:
     results_dir = find_or_create_results_dir(video_id, title)
     info(f"results folder: {results_dir.resolve()}")
     os.chdir(results_dir)
+    debug(f"chdir → {results_dir.resolve()}")
 
     # ----- Idempotency gate -------------------------------------------------
     existing_mp4, existing_srts = find_existing_artifacts(video_id)
+    debug(
+        f"idempotency check: mp4={'yes' if existing_mp4 else 'no'}, "
+        f"existing srts={len(existing_srts)}"
+    )
     skip_downloads = False
     if existing_mp4 is not None:
         action = prompt_existing_files_action(existing_mp4, existing_srts)
+        debug(f"idempotency action: {action}")
         if action == "proceed":
             skip_downloads = True
             video_path = existing_mp4
@@ -871,14 +950,19 @@ def main() -> int:
     if not skip_downloads:
         metadata = get_video_metadata(url)
         heights = available_video_heights(metadata)
+        debug(f"available heights: {heights}")
         prev_quality = read_quality(video_id)
         chosen_height = prompt_quality(heights, prev_quality)
+        debug(f"chosen height: {chosen_height}p")
         write_sidecar(quality_sidecar(video_id), str(chosen_height))
 
         video_path = download_video(url, video_id, max_height=chosen_height)
 
         sub_langs_raw = available_subtitle_langs(metadata)
         sub_langs = normalize_subtitle_langs(sub_langs_raw)
+        debug(
+            f"subtitle langs: raw={sub_langs_raw}, normalized={sub_langs}"
+        )
         download_all_subtitles(url, video_id, sub_langs)
 
     # ----- Summary ----------------------------------------------------------

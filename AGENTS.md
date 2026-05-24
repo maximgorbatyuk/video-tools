@@ -174,8 +174,11 @@ Use suffixes to disambiguate purposes:
 - Primary outputs: `<ID>.<ext>` (e.g. `<ID>.srt`, `<ID>.mp4`)
 - Per-language source files: `<ID>.<lang>.srt` (e.g. `<ID>.en.srt`,
   `<ID>.zh.srt`)
-- Per-(source, target)-language outputs:
-  `<ID>.translated.<src-slug>-to-<target-slug>.md`
+- Translated subtitles: `<ID>.translated.<target-code>.srt` (e.g.
+  `<ID>.translated.ru.srt`). The `.translated.` infix is what
+  separates these from YouTube-supplied per-language files; never
+  drop it, or translate.py will silently overwrite the source-side
+  SRTs.
 - Sidecars: `<ID>.<purpose>.txt` (e.g. `<ID>.lang.txt`,
   `<ID>.translate-source-lang.txt`, `<ID>.translate-target-lang.txt`,
   `<ID>.video-quality.txt`, `<ID>.summary-speaker.txt`,
@@ -224,6 +227,15 @@ Use the color-coded log helpers from `scripts/_common.py` (`info` / `ok` /
 `warn` / `err` / `die`) for readable terminal output. Don't add emoji unless
 the user explicitly asks for it.
 
+For diagnostic logs that should be off by default, use `debug(msg)` from
+`scripts/_common.py` — silent unless `set_verbose(True)` has been called,
+prints dim `[d]` lines to stderr. Wrap slow subprocess calls with the
+`time_block(label)` context manager from the same module so verbose runs
+show start + duration. Every functional script accepts `-v` / `--verbose`
+via `argparse` and calls `set_verbose(args.verbose)` at the very top of
+`main()`. `start.py` forwards `--verbose` to the dispatched script and
+also honors `VIDEO_TOOLS_VERBOSE=1` in the environment.
+
 ### 5.7 No external state
 
 A script must not depend on global config, environment variables, or hidden
@@ -234,14 +246,14 @@ sidecar files next to the outputs.
 ### 5.8 Privacy / copyright
 
 Test outputs generated against real third-party videos (the `.mp4`, `.srt`,
-`.txt`, `.json`, `.tsv`, `.vtt`, `.dialogue.txt`, `.translated.*.md`,
-`.translated.*.broken.md`, `.lang.txt`, `.translate-*.txt`,
-`.video-quality.txt`, `.summary.md`, and `.summary-*.txt` files named by
-an 11-character YouTube ID — as well as the entire `results/` folder
-both functional scripts write them into) are **not** committed to the
-repo. `.gitignore` covers these extensions and the `results/` directory.
-When adding new output file types or top-level output directories,
-extend `.gitignore` in the same change.
+`.txt`, `.json`, `.tsv`, `.vtt`, `.dialogue.txt`,
+`.translated.<tgt>.srt`, `.translated.<tgt>.broken.srt`, `.lang.txt`,
+`.translate-*.txt`, `.video-quality.txt`, `.summary.md`, and
+`.summary-*.txt` files named by an 11-character YouTube ID — as well as
+the entire `results/` folder both functional scripts write them into)
+are **not** committed to the repo. `.gitignore` covers these extensions
+and the `results/` directory. When adding new output file types or
+top-level output directories, extend `.gitignore` in the same change.
 
 ### 5.9 Self-documenting scripts
 
@@ -386,23 +398,29 @@ part of the implementation, not a follow-up.
   `prompts/translate_fix_prompt.md` (along with the original SRT and
   the broken output) and `claude -p` is called again. If validation
   still fails, the broken output is written to
-  `<ID>.translated.<src>-to-<tgt>.broken.md` and the script dies with
-  the issue list — never produces a `.md` file under the canonical name
+  `<ID>.translated.<tgt>.broken.srt` and the script dies with the
+  issue list — never produces an `.srt` file under the canonical name
   with bad timecodes.
-- Outputs are namespaced by both languages:
-  `<ID>.translated.<src-slug>-to-<target-slug>.md`. Three sidecars
-  (`<ID>.translate-source-lang.txt`, `<ID>.translate-target-lang.txt`,
-  `<ID>.video-quality.txt`) let the script offer "re-use last" on
-  subsequent runs.
+- **Output is a plain SubRip (.srt) file**, not side-by-side Markdown.
+  The prompt template explicitly tells Claude to emit a valid `.srt`
+  document in the target language (cue numbers + timecodes preserved
+  verbatim, translated text under each timecode). The result is
+  written to `<ID>.translated.<tgt>.srt` ready for any video player.
+  `<tgt>` is the lowercased 2-letter code produced by
+  `lang_label(target_lang).lower()` (`ru`, `en`, `kk`).
+- Three sidecars (`<ID>.translate-source-lang.txt`,
+  `<ID>.translate-target-lang.txt`, `<ID>.video-quality.txt`) let the
+  script offer "re-use last" on subsequent runs.
 - All language-related and prompt-construction helpers (`lang_label`,
   `slug_lang`, `canonical_lang_name`, `normalize_subtitle_langs`,
   `lang_from_srt_path`, `default_quality_choice`, `extract_timecodes`,
   `validate_timecodes`, `build_translate_prompt`,
-  `build_translate_fix_prompt`, `translated_md_path`) are pure
-  functions designed for unit-testing. Keep them pure if you change
-  them. `build_translate_prompt` and `build_translate_fix_prompt` take
-  the template as a string argument so the file I/O stays out of the
-  pure layer.
+  `build_translate_fix_prompt`, `translated_srt_path`,
+  `broken_translated_srt_path`) are pure functions designed for
+  unit-testing. Keep them pure if you change them.
+  `build_translate_prompt` and `build_translate_fix_prompt` take the
+  template as a string argument so the file I/O stays out of the pure
+  layer.
 
 ### Adding a new functional script
 

@@ -12,9 +12,9 @@ paying strict attention to the timecodes.
 
 The output you produced on the previous attempt did not preserve the
 timecodes from the source SRT file. A Python validator extracted every
-`HH:MM:SS,mmm --> HH:MM:SS,mmm` range from the source and from your
-output, then compared them in order. The mismatches it found are listed
-below.
+`HH:MM:SS,mmm --> HH:MM:SS,mmm` line from the source and from your
+output, then compared them position-by-position. The mismatches it
+found are listed below.
 
 ### Timecode inconsistencies
 
@@ -22,29 +22,29 @@ below.
 
 ## Your task
 
-Redo the translation. The output format is unchanged from the previous
-attempt:
+Redo the translation. Emit a valid SubRip (.srt) subtitle file in
+{{target_lang}}, with this exact structure per cue:
 
-    [HH:MM:SS,mmm --> HH:MM:SS,mmm]
-    {{src_label}}: <the original {{source_lang}} line, verbatim>
-    {{tgt_label}}: <a natural, fluent translation into {{target_lang}}>
+    <cue_number>
+    HH:MM:SS,mmm --> HH:MM:SS,mmm
+    <translated {{target_lang}} text>
 
-Separate blocks with one blank line. Output ONLY the cue blocks — no
-preamble, no headings, no closing remarks, no markdown code fences.
+Separate cues with one blank line. Output ONLY the .srt content — no
+preamble, no headings, no markdown code fences, no commentary. The very
+first character of your response must be the `1` of the first cue.
 
 ## Hard rules (re-iterated)
 
-1. **Copy every timecode character-for-character** from the source SRT.
-   Do not round, re-format, shift, merge, or split timecodes. The
-   validator will run again on your output.
-2. **Emit one block per cue in the source**, in the same order. No
-   reordering. No merging. No dropping. The block count must equal the
-   source cue count.
+1. **Copy every timecode character-for-character** from the source
+   SRT. The validator will run again on your output.
+2. **Emit one cue per source cue, in the same order**, with the same
+   cue numbers. No reordering. No merging. No dropping. The cue count
+   must equal the source cue count.
 3. **Preserve sentence-level meaning** when translating. Natural prose,
-   not word-for-word, but every sentence in the source must be reflected
-   in the {{tgt_label}} line of the corresponding block.
-4. **Use the original {{source_lang}} text verbatim** on the
-   {{src_label}} line.
+   not word-for-word — but every sentence in the source must be
+   reflected in its target cue.
+4. **Do not include the original {{source_lang}} text** in the output.
+   Only the {{target_lang}} translation goes under each timecode.
 
 ## Original SRT (the source of truth for timecodes)
 
@@ -54,6 +54,6 @@ preamble, no headings, no closing remarks, no markdown code fences.
 
 The block below is what you produced last time. Do NOT copy its
 timecodes — they are the ones that failed validation. Use it only to
-see which translations you can keep and which you must redo.
+see which translations you can keep verbatim and which you must redo.
 
 {{broken_translation}}
