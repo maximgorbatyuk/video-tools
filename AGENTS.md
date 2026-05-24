@@ -25,10 +25,13 @@ this file as the agent-facing rulebook.
 video-tools/
 ├── start.py                 ← interactive entrypoint, dispatches to scripts/
 ├── scripts/
-│   ├── transcribe.py        ← functional script (mlx_whisper)
+│   ├── transcribe.py        ← functional script (mlx_whisper + optional claude summary)
 │   ├── translate.py         ← functional script (claude)
 │   └── _common.py           ← shared helpers (NOT a runnable script)
+├── prompts/
+│   └── summary_prompt.md    ← prompt template consumed by transcribe.py's summary step
 ├── docs/transcribe_instruction.md
+├── results/                 ← per-video output folders (gitignored; created on first run)
 ├── README.md
 ├── AGENTS.md
 ├── CLAUDE.md
@@ -54,6 +57,14 @@ Two rules govern this layout. Follow them when adding new tooling:
 `scripts/_common.py` is a module, not a script. It must remain side-effect-
 free at import time, must not call `sys.exit`, `input`, or `print` at module
 scope, and must not be registered in `start.py`'s menu.
+
+`prompts/*.md` files are static prompt templates read at runtime by the
+functional scripts. They use `{{placeholder}}` markers that scripts
+substitute with plain `str.replace()` (no Python format-string semantics),
+so user-supplied values are free to contain `{` and `}` without escaping.
+Scripts should resolve the prompts directory via a path derived from
+`__file__`, not from the current working directory — transcribe.py
+`chdir`s into its results folder before it ever reads a prompt.
 
 ---
 
@@ -87,7 +98,7 @@ Shared preflight helpers (`check_yt_dlp`, `check_ffmpeg`) live in
 | `yt-dlp` | `scripts/transcribe.py`, `scripts/translate.py` | `brew install yt-dlp` |
 | `ffmpeg` | `scripts/transcribe.py`, `scripts/translate.py` | `brew install ffmpeg` |
 | `mlx_whisper` | `scripts/transcribe.py` | `brew install pipx && pipx ensurepath && pipx install mlx-whisper` |
-| `claude` | `scripts/translate.py` | `npm install -g @anthropic-ai/claude-code && claude login` |
+| `claude` | `scripts/translate.py` (always); `scripts/transcribe.py` (only if the user opts into the summary step) | `npm install -g @anthropic-ai/claude-code && claude login` |
 
 Notes:
 - `mlx-whisper` is **not** a Homebrew formula. Install via `pipx`. The binary
@@ -155,7 +166,33 @@ Use suffixes to disambiguate purposes:
 - Per-(source, target)-language outputs:
   `<ID>.translated.<src-slug>-to-<target-slug>.md`
 - Sidecars: `<ID>.<purpose>.txt` (e.g. `<ID>.lang.txt`,
-  `<ID>.translate-source-lang.txt`, `<ID>.translate-target-lang.txt`)
+  `<ID>.translate-source-lang.txt`, `<ID>.translate-target-lang.txt`,
+  `<ID>.summary-speaker.txt`, `<ID>.summary-context.txt`)
+
+#### Per-video results folder
+
+`scripts/transcribe.py` groups all of one video's outputs under a
+**results folder**:
+
+    <CWD>/results/<YYYY-MM-DD>_<video-title-slug>/
+
+The slug is built by lowercasing the YouTube title and collapsing
+non-word characters into underscores (Unicode letters/digits are kept).
+The lookup is **video-ID-keyed, not date-keyed** — on a re-run the helper
+scans `results/*/` for any folder already containing a file starting
+with `<ID>.`, and re-uses it instead of creating a fresh dated folder.
+The date prefix is therefore the date of the *first* run for a given
+video, not the most recent run.
+
+The helper that implements this lives in `scripts/_common.py`
+(`find_or_create_results_dir`). Functional scripts that adopt the
+results-folder layout should call it then `os.chdir()` into the returned
+path before any other I/O, so the rest of the script can keep using
+CWD-relative filenames.
+
+`scripts/translate.py` currently writes to CWD directly (it doesn't use
+the results-folder layout yet). If you add a script that produces more
+than ~3 files for a single input, prefer the results-folder pattern.
 
 ### 5.5 Stdlib-only Python
 
@@ -187,10 +224,12 @@ sidecar files next to the outputs.
 
 Test outputs generated against real third-party videos (the `.mp4`, `.srt`,
 `.txt`, `.json`, `.tsv`, `.vtt`, `.dialogue.txt`, `.translated.*.md`,
-`.lang.txt`, `.translate-*.txt`, and `.summary.md` files named by an 11-
-character YouTube ID) are **not** committed to the repo. The current
-`.gitignore` already excludes the common extensions. When adding new output
-file types, extend `.gitignore` in the same change.
+`.lang.txt`, `.translate-*.txt`, `.summary.md`, and `.summary-*.txt` files
+named by an 11-character YouTube ID — as well as the entire `results/`
+folder transcribe.py writes them into) are **not** committed to the repo.
+The current `.gitignore` already excludes the common extensions. When
+adding new output file types or top-level output directories, extend
+`.gitignore` in the same change.
 
 ### 5.9 Self-documenting scripts
 
@@ -249,8 +288,11 @@ part of the implementation, not a follow-up.
 ### `scripts/_common.py`
 
 - Helpers shared by both functional scripts: log functions, preflight checks
-  for `yt-dlp` + `ffmpeg`, YouTube URL prompt + ID resolver, `download_video`
-  (720p, idempotent), SRT timecode regex, `count_cue_blocks`.
+  (`check_yt_dlp`, `check_ffmpeg`, `check_claude`), YouTube URL prompt + ID
+  resolver + title fetch, `download_video` (720p, idempotent),
+  `download_subtitles_for_lang` (per-language SRT fetch, idempotent,
+  best-effort), `video_title_to_slug` + `find_or_create_results_dir`
+  (per-video results folder), SRT timecode regex, `count_cue_blocks`.
 - Side-effect-free at import time. Do not add module-level `print`, `input`,
   or `sys.exit` calls.
 - Leading underscore signals "internal module". Don't register it in
@@ -258,15 +300,32 @@ part of the implementation, not a follow-up.
 
 ### `scripts/transcribe.py`
 
-- Transcription path only — downloads the video then runs `mlx_whisper`
-  with `whisper-large-v3-turbo` and `--output-format all`.
+- Pipeline: resolve URL → fetch ID + title → `find_or_create_results_dir`
+  + `chdir` → `download_video` → optional `download_subtitles_for_lang`
+  (best-effort YouTube subs) → `mlx_whisper` (turbo, `--output-format all`)
+  → `write_dialogue_txt` → optional summary step.
+- All outputs land inside `results/<YYYY-MM-DD>_<slug>/`. The folder is
+  resolved by video ID, so re-running on a later day re-uses the same
+  folder rather than creating a new dated one.
 - Post-processes the SRT into `<ID>.dialogue.txt` (paragraphs split on
   silence gaps controlled by the `PARAGRAPH_GAP_SECONDS` constant — the
   threshold above which a gap starts a new paragraph).
 - Sidecar `<ID>.lang.txt` records the last language used so re-runs can
   offer "same language".
+- **Summary step (opt-in)**: after dialogue.txt is written, the script
+  asks `Summarize this video with claude? [y/N]`. If yes, it preflight-
+  checks `claude`, asks for a speaker name and optional context (both
+  sidecar-backed via `<ID>.summary-speaker.txt` and
+  `<ID>.summary-context.txt`), substitutes them along with the
+  dialogue.txt body into `prompts/summary_prompt.md` using plain
+  `str.replace()`, calls `claude -p`, and writes `<ID>.summary.md`. A
+  re-run with an existing summary offers `[s]/[r]/[c]`. The prompt
+  template path is resolved from `__file__`, not CWD, so the chdir into
+  the results folder doesn't break it.
 - No speaker diarization. If diarization becomes a requirement, the
   agreed-upon path is to layer `pyannote-audio` on top of mlx_whisper.
+  The summary step infers speaker turns from context rather than from
+  labels.
 
 ### `scripts/translate.py`
 

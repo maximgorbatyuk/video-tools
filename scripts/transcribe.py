@@ -3,10 +3,10 @@
 scripts/transcribe.py
 =====================
 
-Interactive command-line tool that downloads a YouTube video at 720p and
-transcribes its audio into subtitles + plain text + a paragraph-grouped
-reading copy, using mlx_whisper (the Apple Silicon / MLX port of OpenAI
-Whisper) with the `whisper-large-v3-turbo` model.
+Interactive command-line tool that downloads a YouTube video at 720p,
+fetches its YouTube-hosted subtitles (best-effort), transcribes the
+audio locally with `mlx_whisper` + the `whisper-large-v3-turbo` model,
+and optionally asks `claude` to summarize the resulting transcript.
 
 This script is one of the functional scripts in this repo. It can be
 launched from the top-level menu via `python3 start.py` or run directly
@@ -28,6 +28,10 @@ Prerequisites (all must be on PATH)
     mlx_whisper   — Whisper on MLX            →  brew install pipx
                     (NOT a Homebrew formula)     pipx ensurepath
                                                  pipx install mlx-whisper
+    claude        — Claude Code CLI           →  npm install -g
+                    (only used if the user        @anthropic-ai/claude-code
+                     opts into the summary       claude login
+                     step at the end)
 
 The turbo model (~1.5 GB) is downloaded automatically on first use and
 cached at  ~/.cache/huggingface/hub/  for subsequent runs.
@@ -39,27 +43,51 @@ Usage
         or
     python3 start.py   (then pick option 1)
 
-The script is fully interactive:
-    1. Runs preflight checks for the three CLI dependencies above.
-    2. Prompts for a YouTube URL.
-    3. Resolves it to the canonical 11-char video ID (via yt-dlp).
-    4. Downloads the 720p MP4 (skipped if already on disk).
-    5. Prompts for the language (ISO-639-1 code, e.g. `en`, `ru`, `de`)
-       or `auto` for Whisper's language detection.
-    6. Transcribes with mlx_whisper.
-    7. Post-processes the SRT into a readable dialogue.txt grouped into
-       paragraphs by silence gaps.
+The script is fully interactive. The algorithm is:
+
+    1. Preflight checks for yt-dlp, ffmpeg, and mlx_whisper. (`claude` is
+       only checked later, on demand, since the summary step is opt-in.)
+    2. Prompt for a YouTube URL.
+    3. Resolve it to the canonical 11-char video ID and fetch the
+       video's title (both via yt-dlp).
+    4. Decide where outputs go:
+         - If a folder under `<CWD>/results/` already contains a file
+           starting with `<ID>.`, re-use it.
+         - Otherwise create `<CWD>/results/<YYYY-MM-DD>_<slug>/` and
+           `chdir` into it.
+       From here on every output filename is relative to that folder.
+    5. Download the 720p MP4 (skipped if already on disk).
+    6. Prompt for the language (ISO-639-1, e.g. `en`, `ru`, `de`) or
+       `auto` for Whisper's language detection.
+    7. Best-effort fetch of the YouTube-hosted subtitles in the chosen
+       language (or English when auto-detect is selected). A miss is a
+       warning, not an error.
+    8. Run `mlx_whisper` to produce SRT/TXT/VTT/JSON/TSV and a
+       paragraph-grouped dialogue.txt.
+    9. Ask whether to summarize the transcript via `claude`. If yes:
+         - Preflight `claude`.
+         - Prompt for speaker name and (optional) context — sidecar-
+           backed so re-runs offer "re-use last".
+         - Substitute into the template at `prompts/summary_prompt.md`,
+           feed the result to `claude -p`, and write `<ID>.summary.md`.
 
 ------------------------------------------------------------------------
-Outputs (written to current working directory, named by video ID)
+Outputs (all written into the per-video results folder)
 ------------------------------------------------------------------------
-    <ID>.mp4           — 720p video download
-    <ID>.srt           — subtitles with timecodes (from mlx_whisper)
-    <ID>.txt           — plain transcript          (from mlx_whisper)
-    <ID>.dialogue.txt  — paragraph-grouped readable transcript with
-                         [HH:MM:SS] timecodes per paragraph
-    <ID>.lang.txt      — sidecar remembering which language was used
-                         (so re-runs can offer "same language" option)
+    results/<YYYY-MM-DD>_<slug>/
+        <ID>.mp4                — 720p video download
+        <ID>.<lang>.srt         — YouTube-hosted subtitles (if available)
+        <ID>.srt                — whisper subtitles with timecodes
+        <ID>.txt                — whisper plain transcript
+        <ID>.dialogue.txt       — paragraph-grouped readable transcript
+                                  with [HH:MM:SS] timecodes per paragraph
+        <ID>.lang.txt           — sidecar: language used for the last
+                                  whisper run
+        <ID>.summary.md         — (optional) claude-generated long-form
+                                  summary of the transcript
+        <ID>.summary-speaker.txt   — sidecar: speaker name for the summary
+        <ID>.summary-context.txt   — sidecar: speaker context for the
+                                              summary
 
 mlx_whisper also writes <ID>.vtt, <ID>.json, and <ID>.tsv as side effects
 of `--output-format all`; they are not used downstream by this script.
@@ -67,12 +95,18 @@ of `--output-format all`; they are not used downstream by this script.
 ------------------------------------------------------------------------
 Idempotency / re-running on the same video
 ------------------------------------------------------------------------
+    * The results folder is re-used across days — the lookup is by
+      video ID, not by date. The date only appears in the folder name
+      the first time outputs are produced.
     * If <ID>.mp4 already exists, the download step is skipped.
+    * If <ID>.<lang>.srt already exists, the subtitle fetch is skipped.
     * If <ID>.srt and <ID>.txt already exist, the script asks whether to:
           [s]kip transcription,
           [r]e-run with the same language as before, or
           [c]hange language and re-run.
-      The previous language is remembered via the <ID>.lang.txt sidecar.
+      The previous language is remembered via <ID>.lang.txt.
+    * If <ID>.summary.md already exists at summary time the script
+      offers [s]kip / [r]e-run / [c]hange.
 
 ------------------------------------------------------------------------
 Limitations
@@ -84,6 +118,8 @@ Limitations
       (in _common.py) if you need a different resolution.
     * Hardcoded to the turbo model (see MODEL_ID below) for the best
       speed/quality trade-off on Apple Silicon.
+    * The summary step uses <ID>.dialogue.txt as input — speaker turns
+      have to be inferred by claude from context, not from labels.
 """
 
 from __future__ import annotations
@@ -101,11 +137,15 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import (  # noqa: E402
+    check_claude,
     check_ffmpeg,
     check_yt_dlp,
     die,
+    download_subtitles_for_lang,
     download_video,
+    find_or_create_results_dir,
     get_video_id,
+    get_video_title,
     info,
     ok,
     prompt_youtube_url,
@@ -123,6 +163,11 @@ MODEL_CACHE_DIR = HF_CACHE_DIR / "models--mlx-community--whisper-large-v3-turbo"
 # Pause (in seconds) between SRT segments above which we start a new paragraph
 # in the dialogue.txt output.
 PARAGRAPH_GAP_SECONDS = 1.5
+
+# Location of the summary prompt template — resolved relative to the script,
+# so it works regardless of which folder we chdir into later.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SUMMARY_PROMPT_TEMPLATE = REPO_ROOT / "prompts" / "summary_prompt.md"
 
 
 # ----------------------------------------------------------------------------
@@ -370,6 +415,182 @@ def write_dialogue_txt(video_id: str) -> None:
 
 
 # ----------------------------------------------------------------------------
+# Summary step (claude)
+# ----------------------------------------------------------------------------
+
+SUMMARY_SPEAKER_SIDECAR_TMPL = "{vid}.summary-speaker.txt"
+SUMMARY_CONTEXT_SIDECAR_TMPL = "{vid}.summary-context.txt"
+
+
+def summary_output_path(video_id: str) -> Path:
+    return Path(f"{video_id}.summary.md")
+
+
+def _read_text_sidecar(path: Path) -> Optional[str]:
+    if not path.exists():
+        return None
+    val = path.read_text(encoding="utf-8").strip()
+    return val or None
+
+
+def _write_text_sidecar(path: Path, value: str) -> None:
+    path.write_text(value.strip() + "\n", encoding="utf-8")
+
+
+def prompt_yes_no(question: str, default_no: bool = True) -> bool:
+    suffix = " [y/N]: " if default_no else " [Y/n]: "
+    raw = input(question + suffix).strip().lower()
+    if not raw:
+        return not default_no
+    return raw in ("y", "yes")
+
+
+def prompt_resummarize(video_id: str) -> str:
+    """Returns 'skip', 'same', or 'change'."""
+    print()
+    info(f"summary already exists: {summary_output_path(video_id)}")
+    while True:
+        choice = input(
+            "What now? "
+            "[s]kip / "
+            "[r]e-run with same speaker + context / "
+            "[c]hange and re-run: "
+        ).strip().lower()
+        if choice in ("s", "skip"):
+            return "skip"
+        if choice in ("r", "rerun", "re-run", "same"):
+            return "same"
+        if choice in ("c", "change"):
+            return "change"
+        warn("Please enter s, r, or c.")
+
+
+def prompt_summary_inputs(
+    video_id: str, force_reprompt: bool = False
+) -> tuple[str, str]:
+    """
+    Returns (speaker_name, context). Either may be empty string (context
+    can be empty by design; speaker cannot be empty — we re-ask).
+
+    Sidecar-backed: if previous values are on disk, offers re-use.
+    """
+    speaker_p = Path(SUMMARY_SPEAKER_SIDECAR_TMPL.format(vid=video_id))
+    context_p = Path(SUMMARY_CONTEXT_SIDECAR_TMPL.format(vid=video_id))
+    prev_speaker = _read_text_sidecar(speaker_p)
+    prev_context = _read_text_sidecar(context_p)
+
+    if not force_reprompt and prev_speaker is not None:
+        info(f"previous summary speaker: {prev_speaker}")
+        if prev_context:
+            info(f"previous summary context: {prev_context}")
+        if prompt_yes_no("Re-use these?", default_no=False):
+            return prev_speaker, prev_context or ""
+
+    while True:
+        default_hint = f" [default: {prev_speaker}]" if prev_speaker else ""
+        speaker = input(f"\nSpeaker name{default_hint}: ").strip()
+        if not speaker and prev_speaker:
+            speaker = prev_speaker
+        if speaker:
+            break
+        warn("Speaker name cannot be empty.")
+
+    ctx_default_hint = ""
+    if prev_context:
+        ctx_default_hint = f" [default: {prev_context}]"
+    context = input(
+        f"Context — one or two sentences about the speaker and what the "
+        f"interview covers (optional, press Enter to skip){ctx_default_hint}: "
+    ).strip()
+    if not context and prev_context:
+        context = prev_context
+
+    return speaker, context
+
+
+def build_summary_prompt(template: str, speaker: str, context: str, transcript: str) -> str:
+    """
+    Substitute the three placeholders into the prompt template.
+
+    Uses plain .replace() so braces in user-supplied context don't get
+    interpreted as format-string fields.
+    """
+    return (
+        template
+        .replace("{{speaker_name}}", speaker)
+        .replace("{{context}}", context)
+        .replace("{{transcript}}", transcript)
+    )
+
+
+def run_claude(prompt: str) -> str:
+    """Call `claude -p <prompt>` and return stdout."""
+    info("invoking claude CLI (this may take a minute for longer transcripts)…")
+    try:
+        result = subprocess.run(
+            ["claude", "-p", prompt],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        die(
+            "`claude` CLI returned a non-zero exit code.",
+            f"stderr:\n{e.stderr}",
+        )
+    return result.stdout
+
+
+def maybe_summarize(video_id: str) -> None:
+    print()
+    if not prompt_yes_no("Summarize this video with claude?"):
+        info("Skipping summary.")
+        return
+
+    if not SUMMARY_PROMPT_TEMPLATE.exists():
+        die(
+            f"Summary prompt template not found at {SUMMARY_PROMPT_TEMPLATE}.",
+            "Make sure you have not moved the `prompts/` folder out of the repo.",
+        )
+
+    transcript_path = Path(f"{video_id}.dialogue.txt")
+    if not transcript_path.exists():
+        die(
+            f"{transcript_path} is missing — cannot build a summary without "
+            f"a transcript.",
+        )
+
+    check_claude()
+
+    force_reprompt = False
+    out_path = summary_output_path(video_id)
+    if out_path.exists():
+        choice = prompt_resummarize(video_id)
+        if choice == "skip":
+            return
+        if choice == "change":
+            force_reprompt = True
+
+    speaker, context = prompt_summary_inputs(video_id, force_reprompt=force_reprompt)
+    template = SUMMARY_PROMPT_TEMPLATE.read_text(encoding="utf-8")
+    transcript = transcript_path.read_text(encoding="utf-8")
+
+    prompt = build_summary_prompt(template, speaker, context, transcript)
+    output = run_claude(prompt).strip()
+    if not output:
+        die("claude returned an empty response.")
+
+    out_path.write_text(output + "\n", encoding="utf-8")
+    _write_text_sidecar(
+        Path(SUMMARY_SPEAKER_SIDECAR_TMPL.format(vid=video_id)), speaker
+    )
+    _write_text_sidecar(
+        Path(SUMMARY_CONTEXT_SIDECAR_TMPL.format(vid=video_id)), context
+    )
+    ok(f"wrote {out_path}")
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 
@@ -386,42 +607,67 @@ def main() -> int:
     video_id = get_video_id(url)
     info(f"video id: {video_id}")
 
+    title = get_video_title(url)
+    if title:
+        info(f"video title: {title}")
+
+    results_dir = find_or_create_results_dir(video_id, title)
+    info(f"results folder: {results_dir.resolve()}")
+    os.chdir(results_dir)
+
     video_path = download_video(url, video_id)
 
     if transcripts_exist(video_id):
         previous_lang = read_previous_language(video_id)
         choice = prompt_retranscribe(video_id, previous_lang)
         if choice == "skip":
-            ok("Skipping transcription. Done.")
-            return 0
-        if choice == "same":
-            if previous_lang and previous_lang != "auto":
-                language = previous_lang
-                info(f"reusing previous language: {language}")
-            elif previous_lang == "auto":
-                language = None
-                info("reusing previous setting: auto-detect")
-            else:
-                warn(
-                    "No record of the previous language. "
-                    "Please enter the language to use now."
-                )
+            ok("Skipping transcription.")
+            language = previous_lang if previous_lang and previous_lang != "auto" else None
+            transcription_ran = False
+        else:
+            if choice == "same":
+                if previous_lang and previous_lang != "auto":
+                    language = previous_lang
+                    info(f"reusing previous language: {language}")
+                elif previous_lang == "auto":
+                    language = None
+                    info("reusing previous setting: auto-detect")
+                else:
+                    warn(
+                        "No record of the previous language. "
+                        "Please enter the language to use now."
+                    )
+                    language = prompt_language()
+            else:  # "change"
                 language = prompt_language()
-        else:  # "change"
-            language = prompt_language()
+            transcription_ran = True
     else:
         language = prompt_language()
+        transcription_ran = True
 
-    run_mlx_whisper(video_path, video_id, language)
-    write_language_sidecar(video_id, language)
-    write_dialogue_txt(video_id)
+    # Best-effort YouTube subtitle fetch (independent of transcription).
+    # Use the chosen language when one is set; fall back to English on
+    # auto-detect so the user still gets *something* if YouTube has it.
+    sub_lang = language or "en"
+    download_subtitles_for_lang(url, video_id, sub_lang)
+
+    if transcription_ran:
+        run_mlx_whisper(video_path, video_id, language)
+        write_language_sidecar(video_id, language)
+        write_dialogue_txt(video_id)
 
     print()
     ok("Transcription done.")
     print(f"  • {video_id}.mp4            — 720p download")
-    print(f"  • {video_id}.srt            — subtitles with timecodes")
-    print(f"  • {video_id}.txt            — plain transcript")
+    yt_srt = Path(f"{video_id}.{sub_lang}.srt")
+    if yt_srt.exists():
+        print(f"  • {yt_srt.name}        — YouTube subtitles ({sub_lang})")
+    print(f"  • {video_id}.srt            — whisper subtitles with timecodes")
+    print(f"  • {video_id}.txt            — whisper plain transcript")
     print(f"  • {video_id}.dialogue.txt   — paragraph-grouped reading copy")
+
+    maybe_summarize(video_id)
+
     return 0
 
 

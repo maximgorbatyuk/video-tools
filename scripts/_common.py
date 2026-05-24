@@ -5,8 +5,11 @@ This module is NOT a runnable script and is not registered in start.py.
 It exposes:
 
     Log helpers:    info / ok / warn / err / die
-    Preflight:      check_yt_dlp, check_ffmpeg
-    YouTube:        YOUTUBE_ID_RE, prompt_youtube_url, get_video_id, download_video
+    Preflight:      check_yt_dlp, check_ffmpeg, check_claude
+    YouTube:        YOUTUBE_ID_RE, prompt_youtube_url, get_video_id,
+                    get_video_title, download_video,
+                    download_subtitles_for_lang
+    Results folder: video_title_to_slug, find_or_create_results_dir
     SRT:            SRT_TIMECODE_RE, count_cue_blocks
 
 Both scripts/transcribe.py and scripts/translate.py import from here.
@@ -19,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Optional
 
@@ -76,6 +80,21 @@ def check_ffmpeg() -> None:
     ok("ffmpeg found")
 
 
+def check_claude() -> None:
+    """Verify the `claude` CLI is on PATH."""
+    if shutil.which("claude") is None:
+        die(
+            "`claude` CLI is not installed or not on PATH.",
+            "Install Claude Code (it provides the `claude` binary):\n"
+            "\n"
+            "    npm install -g @anthropic-ai/claude-code\n"
+            "    claude login\n"
+            "\n"
+            "Then open a new terminal so PATH picks it up.",
+        )
+    ok("claude CLI found")
+
+
 # ----------------------------------------------------------------------------
 # YouTube URL handling
 # ----------------------------------------------------------------------------
@@ -119,6 +138,20 @@ def get_video_id(url: str) -> str:
     return video_id
 
 
+def get_video_title(url: str) -> str:
+    """Return the YouTube video's title (best-effort; falls back to '')."""
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--print", "title", "--no-warnings", url],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError:
+        return ""
+    return (result.stdout or "").strip().splitlines()[-1] if result.stdout else ""
+
+
 def download_video(url: str, video_id: str) -> Path:
     """Download at 720p if not already on disk; return path to the .mp4."""
     out_path = Path(f"{video_id}.mp4")
@@ -146,6 +179,127 @@ def download_video(url: str, video_id: str) -> Path:
             "produced a different container.",
         )
     return out_path
+
+
+def download_subtitles_for_lang(
+    url: str, video_id: str, source_lang: str
+) -> Optional[Path]:
+    """
+    Fetch subtitles in the given language via yt-dlp.
+
+    Returns the path to <ID>.<source_lang>.srt on success, else None.
+    yt-dlp prefers manual (creator-uploaded) subs and falls back to
+    auto-generated; both land at the same filename.
+
+    Best-effort: a missing-subs failure is reported via the return value,
+    not by raising.
+    """
+    out_path = Path(f"{video_id}.{source_lang}.srt")
+    if out_path.exists():
+        ok(f"{source_lang} subtitles already present: {out_path}  (skipping fetch)")
+        return out_path
+
+    info(f"fetching {source_lang} subtitles for {video_id}…")
+    cmd = [
+        "yt-dlp",
+        "--skip-download",
+        "--write-subs",
+        "--write-auto-subs",
+        # <code>.* covers regional variants (en-US, zh-Hans, …); <code>
+        # covers the bare code itself.
+        "--sub-langs", f"{source_lang}.*,{source_lang}",
+        "--sub-format", "srt/best",
+        "--convert-subs", "srt",
+        "-o", f"{video_id}.%(ext)s",
+        url,
+    ]
+    try:
+        subprocess.run(cmd, check=False, capture_output=True, text=True)
+    except Exception as e:  # pragma: no cover — extremely unlikely
+        warn(f"yt-dlp subtitles fetch raised an exception: {e}")
+        return None
+
+    # yt-dlp may write `<ID>.<lang>.srt`, `<ID>.<lang>-orig.srt`,
+    # `<ID>.<lang>-US.srt`, etc. — pick the first match.
+    candidates = sorted(Path(".").glob(f"{video_id}.{source_lang}*.srt"))
+    if not candidates:
+        return None
+
+    chosen = candidates[0]
+    if chosen != out_path:
+        chosen.rename(out_path)
+    ok(f"saved {source_lang} subtitles: {out_path}")
+    return out_path
+
+
+# ----------------------------------------------------------------------------
+# Results folder (per-video output directory)
+# ----------------------------------------------------------------------------
+
+RESULTS_DIR_NAME = "results"
+
+# Marker files we look for when deciding whether an existing results folder
+# already belongs to a given video ID. Any one of these is enough.
+_RESULTS_DIR_MARKERS = (
+    "{vid}.mp4",
+    "{vid}.lang.txt",
+    "{vid}.srt",
+    "{vid}.txt",
+    "{vid}.summary.md",
+    "{vid}.translate-source-lang.txt",
+)
+
+
+def video_title_to_slug(title: str, max_len: int = 60) -> str:
+    """
+    Convert a YouTube video title into a filesystem-safe snake_case slug.
+
+    Keeps Unicode letters and digits (so a Cyrillic or CJK title stays
+    legible), collapses everything else to single underscores. Falls back
+    to 'untitled' if the result is empty.
+    """
+    if not title:
+        return "untitled"
+    s = re.sub(r"\W+", "_", title, flags=re.UNICODE).lower().strip("_")
+    if not s:
+        return "untitled"
+    if len(s) > max_len:
+        s = s[:max_len].rstrip("_") or "untitled"
+    return s
+
+
+def find_or_create_results_dir(
+    video_id: str,
+    title: str,
+    base: Optional[Path] = None,
+) -> Path:
+    """
+    Locate or create the per-video results folder under `<base>/`.
+
+    Lookup order:
+      1. If any sub-folder of `<base>/` already contains a marker file
+         starting with `<video_id>.`, re-use that folder (idempotent across
+         days).
+      2. Otherwise create `<base>/<YYYY-MM-DD>_<slug>/` using today's date
+         and the snake-cased video title.
+
+    The returned path is created on disk and is suitable to `os.chdir()` into.
+    """
+    base = base or Path(RESULTS_DIR_NAME)
+    base.mkdir(parents=True, exist_ok=True)
+
+    for entry in sorted(base.iterdir()):
+        if not entry.is_dir():
+            continue
+        for marker_tmpl in _RESULTS_DIR_MARKERS:
+            if (entry / marker_tmpl.format(vid=video_id)).exists():
+                return entry
+
+    slug = video_title_to_slug(title)
+    today = date.today().isoformat()
+    new_dir = base / f"{today}_{slug}"
+    new_dir.mkdir(parents=True, exist_ok=True)
+    return new_dir
 
 
 # ----------------------------------------------------------------------------

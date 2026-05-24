@@ -91,7 +91,6 @@ Idempotency
 from __future__ import annotations
 
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -101,10 +100,12 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import (  # noqa: E402
+    check_claude,
     check_ffmpeg,
     check_yt_dlp,
     count_cue_blocks,
     die,
+    download_subtitles_for_lang,
     download_video,
     get_video_id,
     info,
@@ -112,77 +113,6 @@ from _common import (  # noqa: E402
     prompt_youtube_url,
     warn,
 )
-
-
-# ----------------------------------------------------------------------------
-# Preflight checks specific to this script
-# ----------------------------------------------------------------------------
-
-def check_claude() -> None:
-    """Verify the `claude` CLI is on PATH."""
-    if shutil.which("claude") is None:
-        die(
-            "`claude` CLI is not installed or not on PATH.",
-            "Install Claude Code (it provides the `claude` binary):\n"
-            "\n"
-            "    npm install -g @anthropic-ai/claude-code\n"
-            "    claude login\n"
-            "\n"
-            "Then open a new terminal so PATH picks it up.",
-        )
-    ok("claude CLI found")
-
-
-# ----------------------------------------------------------------------------
-# Subtitle download
-# ----------------------------------------------------------------------------
-
-def download_subtitles(url: str, video_id: str, source_lang: str) -> Optional[Path]:
-    """
-    Fetch subtitles in the given source language via yt-dlp.
-
-    Returns the path to <ID>.<source_lang>.srt on success, else None.
-    yt-dlp prefers manual (creator-uploaded) subs and falls back to
-    auto-generated; both land at the same filename.
-    """
-    out_path = Path(f"{video_id}.{source_lang}.srt")
-    if out_path.exists():
-        ok(f"{source_lang} subtitles already present: {out_path}  (skipping fetch)")
-        return out_path
-
-    info(f"fetching {source_lang} subtitles for {video_id}…")
-    cmd = [
-        "yt-dlp",
-        "--skip-download",
-        "--write-subs",
-        "--write-auto-subs",
-        # <code>.* covers regional variants (en-US, zh-Hans, …); <code>
-        # covers the bare code itself.
-        "--sub-langs", f"{source_lang}.*,{source_lang}",
-        "--sub-format", "srt/best",
-        "--convert-subs", "srt",
-        "-o", f"{video_id}.%(ext)s",
-        url,
-    ]
-    try:
-        # Don't check=True — a missing-subs failure shouldn't kill the
-        # whole script; we just want to know whether a file landed.
-        subprocess.run(cmd, check=False, capture_output=True, text=True)
-    except Exception as e:  # pragma: no cover — extremely unlikely
-        warn(f"yt-dlp subtitles fetch raised an exception: {e}")
-        return None
-
-    # yt-dlp may write `<ID>.<lang>.srt`, `<ID>.<lang>-orig.srt`,
-    # `<ID>.<lang>-US.srt`, etc. — pick the first match.
-    candidates = sorted(Path(".").glob(f"{video_id}.{source_lang}*.srt"))
-    if not candidates:
-        return None
-
-    chosen = candidates[0]
-    if chosen != out_path:
-        chosen.rename(out_path)
-    ok(f"saved {source_lang} subtitles: {out_path}")
-    return out_path
 
 
 # ----------------------------------------------------------------------------
@@ -518,7 +448,7 @@ def main() -> int:
             "Pick a different target language and try again.",
         )
 
-    srt_path = download_subtitles(url, video_id, source_lang)
+    srt_path = download_subtitles_for_lang(url, video_id, source_lang)
     if srt_path is None:
         die(
             f"No {source_lang} subtitles available on YouTube for "
