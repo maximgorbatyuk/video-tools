@@ -79,20 +79,35 @@ The script is fully interactive. Algorithm:
            one is the source.
          - Ask for the target language: [e]nglish / [r]ussian /
            [k]azakh. Refuse source == target.
-         - Substitute into `prompts/translate_prompt.md` and call
-           `claude -p`. The prompt asks Claude to emit a valid SubRip
-           (.srt) document in the target language with the original
-           cue numbers and timecodes preserved verbatim.
-         - Run `validate_timecodes()` (pure Python) over claude's
-           response. If every timecode matches the source, write the
-           result to `<ID>.translated.<tgt>.srt`.
-         - If the validator finds inconsistencies, retry once with
-           `prompts/translate_fix_prompt.md` — the new prompt embeds
-           the list of mismatched cues. Validate again. If still
-           inconsistent, write the bad attempt to
-           `<ID>.translated.<tgt>.broken.srt` and die with the issue
-           list — the canonical filename is never written with bad
-           timecodes.
+         - Parse the source SRT into a list of cues. Send claude only
+           a numbered tab-delimited list — `<n>\t<source text>` — one
+           cue per line, with timecodes stripped. Timecodes never
+           leave Python, so they can't be corrupted.
+         - Split the cue list into chunks of `CHUNK_SIZE` cues and
+           dispatch up to `MAX_WORKERS` chunks in parallel via
+           `concurrent.futures.ThreadPoolExecutor`. Each worker runs
+           its own `claude -p` subprocess. A background heartbeat
+           thread prints elapsed time + chunks-done every
+           `HEARTBEAT_INTERVAL_S` seconds so a slow chunk never looks
+           hung.
+         - Per chunk: strictly filter the parsed response to cue numbers
+           that were actually in that chunk's input. Claude sometimes
+           hallucinates extra numbers from neighboring ranges (it
+           reaches for "missing" line count by inventing cue numbers
+           further along), and unfiltered they would overwrite real
+           translations from adjacent chunks at the global merge.
+         - Merge each chunk's `{cue_number: translation}` into one
+           global dict. Validate cue-count parity.
+         - If any cues are missing (typically because claude merged
+           sentence-split cues into one translation), do ONE retry
+           call with just the missing cue IDs. Threshold:
+           `MAX_RETRY_MISSING` — above that, skip retry.
+         - On final mismatch: concatenate the per-chunk raw outputs
+           into `<ID>.translated.<tgt>.broken.srt` and die.
+         - Reassemble the final SRT in Python, walking the source cue
+           list and substituting each cue's translated text under the
+           source's original cue number + timecode line. Write to
+           `<ID>.translated.<tgt>.srt`.
 
 ------------------------------------------------------------------------
 Outputs (all written into the per-video results folder)
@@ -144,10 +159,15 @@ Idempotency
 ------------------------------------------------------------------------
 Limitations
 ------------------------------------------------------------------------
-    * Single Claude call per translation pass (plus at most one
-      automated fix-up attempt) — very long videos may exceed Claude's
-      context window. The fix-up loop catches timecode-shape failures
-      but does NOT detect semantic errors in the translation itself.
+    * Validation is cue-count parity only; the script does NOT detect
+      semantic errors in the translation itself.
+    * Translation is parallelized across cue chunks (see CHUNK_SIZE
+      and MAX_WORKERS below), but each individual chunk is a single
+      synchronous `claude -p` call. If a chunk's prompt exceeds
+      Claude's context window, that chunk fails. Tune CHUNK_SIZE
+      downwards if you hit that.
+    * No automatic retry on rate-limit or transient API errors — a
+      single failed chunk aborts the whole translation.
     * Target language is restricted to English, Russian, or Kazakh by
       design. To add another, extend `prompt_target_language`,
       `_LANG_LABELS`, and `canonical_lang_name`.
@@ -156,10 +176,13 @@ Limitations
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import os
 import re
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -199,11 +222,21 @@ from _common import (  # noqa: E402
 # break template lookup.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TRANSLATE_PROMPT_TEMPLATE = REPO_ROOT / "prompts" / "translate_prompt.md"
-TRANSLATE_FIX_PROMPT_TEMPLATE = REPO_ROOT / "prompts" / "translate_fix_prompt.md"
 
-# Max number of fix-up attempts after the first translation pass.
-# 1 = first call + 1 retry on timecode-validation failure.
-MAX_FIXUP_RETRIES = 1
+# Translation chunking. The source cue list is split into chunks of at most
+# CHUNK_SIZE cues; up to MAX_WORKERS chunks run in parallel claude -p calls.
+# A background heartbeat thread prints progress every HEARTBEAT_INTERVAL_S
+# seconds so a slow chunk doesn't look hung.
+CHUNK_SIZE = 1000
+MAX_WORKERS = 4
+HEARTBEAT_INTERVAL_S = 30.0
+
+# Retry pass: if the main pass leaves cues uncovered (typically because
+# claude merged sentence-split cues), we make ONE additional claude call
+# with just those missing cues. If more than this many are missing, we
+# skip the retry and fail — it indicates something more fundamental went
+# wrong than the usual sentence-merge artifact.
+MAX_RETRY_MISSING = 100
 
 
 # ----------------------------------------------------------------------------
@@ -565,100 +598,198 @@ def prompt_retranslate(video_id: str, source_lang: str, target_lang: str) -> str
 
 
 # ----------------------------------------------------------------------------
-# Timecode validation (pure — runs in Python, not via the LLM)
+# SRT parsing + cue serialization (pure — runs in Python, never the LLM)
 # ----------------------------------------------------------------------------
+#
+# The translate flow strips timecodes from the round-trip with claude:
+#   1. Python parses the source SRT into [(cue_num, timecode_line, text)].
+#   2. Python serializes the *translatable* cues as a tab-delimited
+#      `<cue_num>\t<text>` block and sends only that to claude.
+#   3. Claude returns the same shape with translated text.
+#   4. Python parses the response back into {cue_num: translation}.
+#   5. Python re-emits the final SRT, walking the source cue list and
+#      writing the *original* cue number + timecode line under each
+#      translation. Empty source cues (no text) are copied through
+#      unchanged.
+#
+# Net effect: timecodes can't be corrupted because claude never sees them.
 
-# Full timecode line, captured as a single normalized string.
+# Full timecode line, used to locate the timecode inside a cue block.
 SRT_TIMECODE_LINE_RE = re.compile(
     r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})"
 )
 
 
-def extract_timecodes(text: str) -> list[str]:
-    """Return every `HH:MM:SS,mmm --> HH:MM:SS,mmm` range found in `text`, in order."""
-    return [
-        f"{m.group(1)} --> {m.group(2)}"
-        for m in SRT_TIMECODE_LINE_RE.finditer(text)
-    ]
+# (cue_num, timecode_line, text) — text is a single line with internal
+# newlines + tabs collapsed to single spaces. text is "" for empty cues.
+Cue = tuple[int, str, str]
 
 
-def validate_timecodes(source_text: str, translated_text: str) -> list[str]:
+def parse_source_cues(srt_text: str) -> list[Cue]:
+    """Parse an SRT body into [(cue_num, timecode_line, text)].
+
+    The cue_num is a 1-based sequential index assigned by this parser,
+    not the SRT's own cue number — SRTs in the wild sometimes have
+    gaps or non-sequential numbering, and our reassembly only needs
+    a stable handle to match input and output lines.
+
+    timecode_line is the raw `HH:MM:SS,mmm --> HH:MM:SS,mmm` line,
+    preserved verbatim so it can be written back into the final SRT.
+
+    text is the cue's body with internal newlines and tabs collapsed
+    to single spaces (so the prompt's tab delimiter is unambiguous).
+    Empty cues are included with text == "".
     """
-    Compare the timecode sequence in `translated_text` against `source_text`.
+    cues: list[Cue] = []
+    blocks = re.split(r"\n\s*\n", srt_text.strip())
+    for block in blocks:
+        lines = [ln for ln in block.splitlines() if ln.strip()]
+        if not lines:
+            continue
+        tc_idx: Optional[int] = None
+        for i, line in enumerate(lines):
+            if SRT_TIMECODE_LINE_RE.search(line):
+                tc_idx = i
+                break
+        if tc_idx is None:
+            continue
+        timecode_line = lines[tc_idx].strip()
+        text_lines = lines[tc_idx + 1:]
+        text = " ".join(ln.strip() for ln in text_lines if ln.strip())
+        text = text.replace("\t", " ")
+        cues.append((len(cues) + 1, timecode_line, text))
+    return cues
 
-    Returns a (possibly empty) list of human-readable issue descriptions.
-    Empty list = the two sequences match position-by-position.
 
+def chunk_cues(cues: list[Cue], chunk_size: int) -> list[list[Cue]]:
+    """Split `cues` into consecutive windows of at most `chunk_size` cues.
+
+    Empty cues are kept in their natural window — serialize_cues_for_prompt
+    will skip them when emitting the prompt body, so empty cues don't cost
+    a token in the LLM round-trip but still anchor chunk boundaries.
+
+    A non-positive `chunk_size` returns the input as a single chunk.
     Pure: no I/O.
     """
-    src = extract_timecodes(source_text)
-    tgt = extract_timecodes(translated_text)
+    if chunk_size <= 0:
+        return [list(cues)]
+    return [cues[i:i + chunk_size] for i in range(0, len(cues), chunk_size)]
 
+
+def serialize_cues_for_prompt(cues: list[Cue]) -> str:
+    """Render `<cue_num>\\t<text>\\n` for every cue with non-empty text.
+
+    Empty cues are omitted from the LLM round-trip — they're copied
+    through unchanged by assemble_translated_srt without paying the
+    token cost of asking claude to translate empty input.
+    """
+    return "\n".join(
+        f"{num}\t{text}" for (num, _tc, text) in cues if text
+    )
+
+
+def parse_claude_translations(output: str) -> dict[int, str]:
+    """Parse `<cue_num>\\t<text>` lines into `{cue_num: translation}`.
+
+    Tolerant: skips blank lines, lines without a tab, and lines whose
+    pre-tab token isn't an int. validate_translation_coverage decides
+    whether the resulting dict actually covers every translatable cue.
+    """
+    out: dict[int, str] = {}
+    for raw in output.splitlines():
+        line = raw.rstrip("\r")
+        if not line.strip():
+            continue
+        tab = line.find("\t")
+        if tab <= 0:
+            continue
+        head, body = line[:tab].strip(), line[tab + 1:].strip()
+        if not head.isdigit() or not body:
+            continue
+        out[int(head)] = body
+    return out
+
+
+def validate_translation_coverage(
+    cues: list[Cue], translations: dict[int, str]
+) -> list[str]:
+    """Return a list of human-readable issues; empty = all good.
+
+    Every cue with non-empty source text must have a matching key in
+    `translations`. Extra keys in translations (cue numbers that don't
+    exist in the source) are reported but won't block the output —
+    they're just ignored during assembly.
+    """
     issues: list[str] = []
-    if len(src) != len(tgt):
+    translatable = [num for (num, _tc, text) in cues if text]
+    expected = set(translatable)
+    got = set(translations.keys())
+
+    missing = sorted(expected - got)
+    extra = sorted(got - expected)
+
+    if missing:
+        sample = ", ".join(str(n) for n in missing[:10])
+        more = f" (+{len(missing) - 10} more)" if len(missing) > 10 else ""
         issues.append(
-            f"Cue count mismatch: source has {len(src)} cues, "
-            f"translation has {len(tgt)} cues."
+            f"Missing translations for {len(missing)} cue(s): {sample}{more}"
         )
-
-    n = min(len(src), len(tgt))
-    for i in range(n):
-        if src[i] != tgt[i]:
-            issues.append(
-                f"Cue #{i + 1}: expected `{src[i]}`, got `{tgt[i]}`."
-            )
-
-    if len(tgt) < len(src):
-        for i in range(len(tgt), len(src)):
-            issues.append(
-                f"Cue #{i + 1}: missing from translation (source: `{src[i]}`)."
-            )
-    elif len(tgt) > len(src):
-        for i in range(len(src), len(tgt)):
-            issues.append(
-                f"Position #{i + 1}: extra cue in translation (`{tgt[i]}`) — "
-                f"not in source."
-            )
+    if extra:
+        sample = ", ".join(str(n) for n in extra[:10])
+        more = f" (+{len(extra) - 10} more)" if len(extra) > 10 else ""
+        issues.append(
+            f"Translation has {len(extra)} cue number(s) not in source: "
+            f"{sample}{more}"
+        )
+    if len(translatable) != len(got):
+        # Also surfaces when translation has the right *set* of numbers
+        # but a different count from translatable (shouldn't happen
+        # once missing/extra are zero, but defensive).
+        issues.append(
+            f"Cue count mismatch: source has {len(translatable)} "
+            f"translatable cue(s), translation has {len(got)}."
+        )
     return issues
 
 
+def assemble_translated_srt(
+    cues: list[Cue], translations: dict[int, str]
+) -> str:
+    """Reconstruct a valid SRT body from the source cue list + translations.
+
+    For each source cue:
+      * Emit "<cue_num>\\n<timecode_line>\\n<text>\\n\\n"
+      * Translated text comes from `translations[cue_num]` if present;
+        otherwise the original source text is preserved (covers empty
+        source cues we never sent to claude).
+
+    Cue numbers in the output are the 1-based indices we assigned in
+    parse_source_cues, so the output is always strictly sequential
+    even if the source had gaps.
+    """
+    parts: list[str] = []
+    for num, tc_line, src_text in cues:
+        body = translations.get(num, src_text)
+        parts.append(f"{num}\n{tc_line}\n{body}\n")
+    return "\n".join(parts) + "\n"
+
+
 # ----------------------------------------------------------------------------
-# Prompt builders (template-based, pure, brace-safe)
+# Prompt builder (template-based, pure, brace-safe)
 # ----------------------------------------------------------------------------
 
 def build_translate_prompt(
     template: str,
     source_lang: str,
     target_lang: str,
-    srt_text: str,
+    cues_block: str,
 ) -> str:
-    """Substitute the three placeholders into the first-pass translate prompt."""
+    """Substitute the three placeholders into the translate prompt."""
     return (
         template
         .replace("{{source_lang}}", source_lang)
         .replace("{{target_lang}}", target_lang)
-        .replace("{{srt_text}}", srt_text)
-    )
-
-
-def build_translate_fix_prompt(
-    template: str,
-    video_id: str,
-    source_lang: str,
-    target_lang: str,
-    original_srt: str,
-    broken_translation: str,
-    timecode_issues: str,
-) -> str:
-    """Substitute placeholders into the fix-up reprompt."""
-    return (
-        template
-        .replace("{{video_id}}", video_id)
-        .replace("{{source_lang}}", source_lang)
-        .replace("{{target_lang}}", target_lang)
-        .replace("{{original_srt}}", original_srt)
-        .replace("{{broken_translation}}", broken_translation)
-        .replace("{{timecode_issues}}", timecode_issues)
+        .replace("{{cues_block}}", cues_block)
     )
 
 
@@ -667,14 +798,17 @@ def build_translate_fix_prompt(
 # ----------------------------------------------------------------------------
 
 def _debug_validation_summary(
-    source_text: str, translated_text: str, issues: list[str]
+    cues: list[Cue], translations: dict[int, str], issues: list[str]
 ) -> None:
-    """Emit cue counts + a preview of the first few issues at debug level."""
+    """Emit cue counts + first few issues at debug level."""
     if not is_verbose():
         return
-    src_n = len(extract_timecodes(source_text))
-    tgt_n = len(extract_timecodes(translated_text))
-    debug(f"validator: source has {src_n} cues, translation has {tgt_n} cues")
+    src_n = sum(1 for (_n, _tc, t) in cues if t)
+    tgt_n = len(translations)
+    debug(
+        f"validator: source has {src_n} translatable cue(s), "
+        f"translation returned {tgt_n}"
+    )
     debug(f"validator: {len(issues)} issue(s) total")
     for line in issues[:5]:
         debug(f"  • {line}")
@@ -714,7 +848,120 @@ def run_claude(prompt: str) -> str:
 
 
 # ----------------------------------------------------------------------------
-# Translation orchestrator (with validation + retry)
+# Chunked-parallel translation: worker + heartbeat
+# ----------------------------------------------------------------------------
+
+class _Heartbeat:
+    """Context manager that prints elapsed time + chunks-done periodically.
+
+    Spawns a daemon thread on __enter__ that wakes up every `interval_s`
+    seconds and emits an info() line as long as not every chunk is done.
+    Each worker thread calls .mark_done() when it finishes; .mark_done()
+    is the only mutator besides the stop event.
+    """
+
+    def __init__(self, total: int, interval_s: float = HEARTBEAT_INTERVAL_S):
+        self.total = total
+        self.interval_s = interval_s
+        self.done = 0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._t0 = 0.0
+
+    def __enter__(self) -> "_Heartbeat":
+        self._t0 = time.monotonic()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def mark_done(self) -> None:
+        with self._lock:
+            self.done += 1
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            with self._lock:
+                d = self.done
+            if d >= self.total:
+                return
+            elapsed = time.monotonic() - self._t0
+            mm = int(elapsed // 60)
+            ss = int(elapsed % 60)
+            info(
+                f"…still working: {d}/{self.total} chunk(s) complete, "
+                f"elapsed {mm}m {ss:02d}s"
+            )
+
+
+def _translate_chunk(
+    chunk: list[Cue],
+    template: str,
+    source_name: str,
+    target_name: str,
+    chunk_idx: int,
+    total_chunks: int,
+) -> tuple[dict[int, str], str]:
+    """Translate one chunk of cues. Runs in a worker thread.
+
+    Returns (translations dict, raw claude output). Raises RuntimeError
+    on empty claude response; lets subprocess errors from run_claude
+    propagate via SystemExit (which the future will surface to main).
+    """
+    cues_block = serialize_cues_for_prompt(chunk)
+    if not cues_block:
+        # All cues in this chunk were empty — nothing to translate, but
+        # still record an empty raw output so the slot is occupied.
+        ok(f"chunk {chunk_idx + 1}/{total_chunks}: no translatable cues (all empty)")
+        return {}, ""
+
+    prompt = build_translate_prompt(
+        template, source_name, target_name, cues_block,
+    )
+    translatable_count = sum(1 for c in chunk if c[2])
+    info(
+        f"chunk {chunk_idx + 1}/{total_chunks}: dispatching "
+        f"({translatable_count} translatable cue(s), "
+        f"{len(cues_block)} chars)"
+    )
+    output = run_claude(prompt).strip()
+    if not output:
+        raise RuntimeError(
+            f"chunk {chunk_idx + 1}/{total_chunks}: claude returned empty."
+        )
+    raw_translations = parse_claude_translations(output)
+
+    # Strict per-chunk filter: drop any cue number claude emitted that
+    # wasn't actually in this chunk's input. Claude sometimes hallucinates
+    # numbers from neighboring ranges when it merges sentence-split cues
+    # (to keep the line count matching), and those bogus numbers could
+    # otherwise overwrite real translations from adjacent chunks during
+    # the global dict.update() merge.
+    expected_ids = {n for (n, _tc, t) in chunk if t}
+    translations = {n: t for n, t in raw_translations.items() if n in expected_ids}
+    dropped = len(raw_translations) - len(translations)
+    if dropped > 0:
+        debug(
+            f"chunk {chunk_idx + 1}/{total_chunks}: dropped {dropped} "
+            f"hallucinated cue ID(s) outside chunk range"
+        )
+
+    extras_note = f" (dropped {dropped} extras)" if dropped > 0 else ""
+    ok(
+        f"chunk {chunk_idx + 1}/{total_chunks}: "
+        f"{len(translations)}/{translatable_count} cue(s) translated"
+        f"{extras_note}"
+    )
+    return translations, output
+
+
+# ----------------------------------------------------------------------------
+# Translation orchestrator
 # ----------------------------------------------------------------------------
 
 def translate_subtitles(
@@ -723,8 +970,15 @@ def translate_subtitles(
     source_lang: str,
     target_lang: str,
 ) -> None:
-    """First pass + validated retry. Writes the .srt on success, dies on
-    final failure."""
+    """Translate the SRT and write `<ID>.translated.<tgt>.srt`.
+
+    Timecodes are stripped before each claude call and re-emitted by
+    Python afterwards, so the LLM never sees them. The cue list is
+    split into `CHUNK_SIZE`-sized chunks, dispatched up to `MAX_WORKERS`
+    in parallel, then merged. Validation is cue-count parity only;
+    on mismatch the concatenated raw claude outputs are persisted to
+    `<ID>.translated.<tgt>.broken.srt` and the script dies. No retry.
+    """
     out_path = translated_srt_path(video_id, target_lang)
     if out_path.exists():
         choice = prompt_retranslate(video_id, source_lang, target_lang)
@@ -754,90 +1008,131 @@ def translate_subtitles(
 
     source_name = canonical_lang_name(source_lang)
     target_name = canonical_lang_name(target_lang)
-    debug(
-        f"translating {srt_path.name}: "
-        f"{source_name} → {target_name} "
-        f"({len(srt_text)} chars source SRT)"
-    )
 
-    # ---------- First pass --------------------------------------------------
-    template = TRANSLATE_PROMPT_TEMPLATE.read_text(encoding="utf-8")
-    prompt = build_translate_prompt(
-        template, source_name, target_name, srt_text,
-    )
-    output = run_claude(prompt).strip()
-    if not output:
-        die("claude returned an empty response on the first translation pass.")
-
-    issues = validate_timecodes(srt_text, output)
-    _debug_validation_summary(srt_text, output, issues)
-
-    # ---------- Optional fix-up attempts -----------------------------------
-    if issues:
-        warn(
-            f"Timecode validation found {len(issues)} issue(s) in claude's "
-            f"first pass. Asking claude to redo with the failing cues "
-            f"highlighted…"
+    cues = parse_source_cues(srt_text)
+    translatable = [c for c in cues if c[2]]
+    if not translatable:
+        die(
+            f"{srt_path} parsed to zero translatable cues.",
+            "The file may be empty or malformed.",
         )
-        if not TRANSLATE_FIX_PROMPT_TEMPLATE.exists():
-            die(
-                f"Fix-up prompt template not found at "
-                f"{TRANSLATE_FIX_PROMPT_TEMPLATE}.",
-                "Make sure the `prompts/` folder hasn't been moved out of "
-                "the repo.",
-            )
-        fix_template = TRANSLATE_FIX_PROMPT_TEMPLATE.read_text(encoding="utf-8")
 
-        for attempt in range(MAX_FIXUP_RETRIES):
-            issues_block = "\n".join(f"- {line}" for line in issues)
-            fix_prompt = build_translate_fix_prompt(
-                fix_template,
-                video_id=video_id,
-                source_lang=source_name,
-                target_lang=target_name,
-                original_srt=srt_text,
-                broken_translation=output,
-                timecode_issues=issues_block,
-            )
+    chunks = chunk_cues(cues, CHUNK_SIZE)
+    info(
+        f"translating {len(translatable)} cue(s) "
+        f"in {len(chunks)} chunk(s) of up to {CHUNK_SIZE}; "
+        f"running up to {MAX_WORKERS} in parallel"
+    )
+    debug(
+        f"{srt_path.name}: {source_name} → {target_name}; "
+        f"chunk sizes: "
+        f"{[sum(1 for c in chunk if c[2]) for chunk in chunks]}"
+    )
+
+    template = TRANSLATE_PROMPT_TEMPLATE.read_text(encoding="utf-8")
+
+    all_translations: dict[int, str] = {}
+    raw_outputs: list[str] = []
+    t0 = time.monotonic()
+
+    with _Heartbeat(total=len(chunks)) as hb:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=MAX_WORKERS,
+            thread_name_prefix="translate",
+        ) as pool:
+            futures = [
+                pool.submit(
+                    _translate_chunk,
+                    chunk, template, source_name, target_name,
+                    i, len(chunks),
+                )
+                for i, chunk in enumerate(chunks)
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                chunk_translations, raw = future.result()
+                all_translations.update(chunk_translations)
+                raw_outputs.append(raw)
+                hb.mark_done()
+
+    elapsed = time.monotonic() - t0
+    info(f"all chunks completed in {elapsed:.1f}s")
+
+    issues = validate_translation_coverage(cues, all_translations)
+    _debug_validation_summary(cues, all_translations, issues)
+
+    # ----- Retry pass for cues claude merged out of existence ---------------
+    #
+    # Most failures of the main pass are claude merging two consecutive
+    # source cues (typically a sentence split across cues like
+    # "Like a dream,\nmay not have actually occurred."). Re-translating
+    # those cues in isolation almost always succeeds since claude has no
+    # adjacent context to merge into.
+    if issues:
+        translatable_set = {n for (n, _tc, t) in cues if t}
+        missing = sorted(translatable_set - set(all_translations.keys()))
+        if missing and len(missing) <= MAX_RETRY_MISSING:
             info(
-                f"fix-up attempt {attempt + 1} of {MAX_FIXUP_RETRIES}…"
+                f"retry pass: {len(missing)} cue(s) missing from the main "
+                f"pass (claude likely merged them with neighbors). "
+                f"Re-translating in isolation…"
             )
-            debug(f"fix-up issues block: {len(issues_block)} chars")
-            output = run_claude(fix_prompt).strip()
-            if not output:
-                die(
-                    "claude returned an empty response on the fix-up pass.",
+            src_by_id = {n: (n, tc, t) for (n, tc, t) in cues}
+            retry_chunk = [src_by_id[n] for n in missing]
+            retry_block = serialize_cues_for_prompt(retry_chunk)
+            if retry_block:
+                retry_prompt = build_translate_prompt(
+                    template, source_name, target_name, retry_block,
                 )
-            issues = validate_timecodes(srt_text, output)
-            _debug_validation_summary(srt_text, output, issues)
-            if not issues:
+                debug(
+                    f"retry prompt: {len(retry_prompt)} chars for "
+                    f"{len(missing)} cue(s)"
+                )
+                with time_block("claude -p (retry)"):
+                    retry_output = run_claude(retry_prompt).strip()
+                retry_translations = parse_claude_translations(retry_output)
+                missing_set = set(missing)
+                retry_translations = {
+                    n: t for n, t in retry_translations.items()
+                    if n in missing_set
+                }
+                all_translations.update(retry_translations)
+                raw_outputs.append(retry_output)
                 ok(
-                    f"timecode validation passed on fix-up attempt "
-                    f"{attempt + 1}."
+                    f"retry pass: recovered "
+                    f"{len(retry_translations)}/{len(missing)} cue(s)"
                 )
-                break
-        else:
-            # All retries exhausted with issues still present.
-            # Persist the broken output for inspection, then die.
-            broken_path = broken_translated_srt_path(video_id, target_lang)
-            broken_path.write_text(output + "\n", encoding="utf-8")
-            preview = "\n".join(issues[:10])
-            more = (
-                f"\n…and {len(issues) - 10} more." if len(issues) > 10 else ""
+                issues = validate_translation_coverage(cues, all_translations)
+                _debug_validation_summary(cues, all_translations, issues)
+        elif missing and len(missing) > MAX_RETRY_MISSING:
+            warn(
+                f"{len(missing)} cue(s) missing — above the retry threshold "
+                f"({MAX_RETRY_MISSING}). Skipping retry pass."
             )
-            die(
-                "claude could not produce a timecode-consistent translation "
-                f"after {MAX_FIXUP_RETRIES + 1} attempt(s).",
-                "First issues:\n"
-                f"{preview}{more}\n\n"
-                f"The last attempt's output has been saved to "
-                f"{broken_path} for inspection.",
-            )
-    else:
-        ok("timecode validation passed on the first pass.")
 
-    # ---------- Write the translated SRT ----------------------------------
-    out_path.write_text(output.rstrip() + "\n", encoding="utf-8")
+    if issues:
+        broken_path = broken_translated_srt_path(video_id, target_lang)
+        sep = "\n\n# === END OF CHUNK ===\n\n"
+        broken_path.write_text(
+            sep.join(raw_outputs).rstrip() + "\n", encoding="utf-8",
+        )
+        preview = "\n".join(issues[:10])
+        more = f"\n…and {len(issues) - 10} more." if len(issues) > 10 else ""
+        die(
+            "claude's response did not cover every source cue, even after "
+            "the retry pass.",
+            "Issues:\n"
+            f"{preview}{more}\n\n"
+            f"The concatenated raw claude outputs have been saved to "
+            f"{broken_path} for inspection.",
+        )
+
+    ok(
+        f"cue-count validation passed "
+        f"({len(all_translations)}/{len(translatable)} translatable cues covered)."
+    )
+
+    final_srt = assemble_translated_srt(cues, all_translations)
+    out_path.write_text(final_srt, encoding="utf-8")
     write_sidecar(source_lang_sidecar(video_id), source_lang)
     write_sidecar(target_lang_sidecar(video_id), target_lang)
     try:
@@ -897,8 +1192,8 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "Print dim [d] diagnostic lines to stderr (yt-dlp argv, claude "
-            "prompt sizes, claude durations, validator cue counts, first "
-            "few timecode issues, output file sizes)."
+            "prompt sizes, claude durations, source/translated cue counts, "
+            "first few missing-cue issues, output file sizes)."
         ),
     )
     return p.parse_args(argv)

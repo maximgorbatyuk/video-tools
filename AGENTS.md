@@ -30,9 +30,9 @@ video-tools/
 │   └── _common.py                 ← shared helpers (NOT a runnable script)
 ├── prompts/
 │   ├── summary_prompt.md          ← consumed by transcribe.py's summary step
-│   ├── translate_prompt.md        ← consumed by translate.py's first translation pass
-│   └── translate_fix_prompt.md    ← consumed by translate.py's automated fix-up
-│                                    pass on timecode-validation failure
+│   └── translate_prompt.md        ← consumed by translate.py (numbered tab-
+│                                    delimited cue list; timecodes never
+│                                    leave Python)
 ├── docs/transcribe_instruction.md
 ├── results/                       ← per-video output folders (gitignored; created on first run)
 ├── README.md
@@ -363,9 +363,15 @@ part of the implementation, not a follow-up.
   quality menu over `available_video_heights` → `download_video` at the
   chosen height → loop `download_subtitles_for_lang` over every
   base-code subtitle language → ask whether to translate → pick source
-  SRT → pick target (EN/RU/KK) → first-pass `claude -p` →
-  `validate_timecodes` → on validation failure, one automated fix-up
-  attempt with `prompts/translate_fix_prompt.md`.
+  SRT → pick target (EN/RU/KK) → `parse_source_cues` → strip timecodes →
+  `chunk_cues` splits the cue list into `CHUNK_SIZE`-sized windows →
+  `ThreadPoolExecutor(max_workers=MAX_WORKERS)` dispatches one
+  `claude -p` per chunk in parallel (background `_Heartbeat` thread
+  prints progress every `HEARTBEAT_INTERVAL_S` seconds) → merge each
+  chunk's `parse_claude_translations` output → one global
+  `validate_translation_coverage` over the merged dict →
+  `assemble_translated_srt` writes the final SRT using the *source's*
+  timecodes.
 - All outputs land inside `results/<YYYY-MM-DD>_<slug>/`, resolved
   by video ID, so re-running on a later day re-uses the same folder.
 - **Idempotency gate**: if `<ID>.mp4` already exists in the results
@@ -390,37 +396,64 @@ part of the implementation, not a follow-up.
 - **Source language is picked from the downloaded SRT files** via a
   numbered menu (auto-skipped when only one SRT is on disk). The code is
   parsed from the filename by `lang_from_srt_path`.
-- **Timecode validation is Python, not LLM-driven**. After each Claude
-  pass, `validate_timecodes(source_text, translated_text)` extracts
-  every `HH:MM:SS,mmm --> HH:MM:SS,mmm` range from both files and
-  compares them position-by-position. A non-empty issue list triggers
-  one fix-up attempt: the issues are embedded into
-  `prompts/translate_fix_prompt.md` (along with the original SRT and
-  the broken output) and `claude -p` is called again. If validation
-  still fails, the broken output is written to
-  `<ID>.translated.<tgt>.broken.srt` and the script dies with the
-  issue list — never produces an `.srt` file under the canonical name
-  with bad timecodes.
-- **Output is a plain SubRip (.srt) file**, not side-by-side Markdown.
-  The prompt template explicitly tells Claude to emit a valid `.srt`
-  document in the target language (cue numbers + timecodes preserved
-  verbatim, translated text under each timecode). The result is
-  written to `<ID>.translated.<tgt>.srt` ready for any video player.
+- **Timecodes never reach the LLM**. `parse_source_cues` parses the
+  source SRT into `[(cue_num, timecode_line, text)]` tuples;
+  `serialize_cues_for_prompt` emits only `<cue_num>\t<text>` lines
+  (translatable cues only). Claude returns the same shape with
+  translated text. `parse_claude_translations` reads its response back
+  into `{cue_num: translation}`. `assemble_translated_srt` walks the
+  *source* cue list to write the final SRT, substituting each cue's
+  translated text under the original cue number + timecode line.
+  Timecode corruption is impossible by construction.
+- **Validation is cue-count parity only**. `validate_translation_coverage`
+  checks that every translatable source cue has a matching key in the
+  parsed translations. On mismatch the raw claude output is written to
+  `<ID>.translated.<tgt>.broken.srt` and the script dies — there is no
+  retry pass.
+- **Output is a plain SubRip (.srt) file**, written by Python (not by
+  claude). `<ID>.translated.<tgt>.srt` is ready for any video player.
   `<tgt>` is the lowercased 2-letter code produced by
   `lang_label(target_lang).lower()` (`ru`, `en`, `kk`).
 - Three sidecars (`<ID>.translate-source-lang.txt`,
   `<ID>.translate-target-lang.txt`, `<ID>.video-quality.txt`) let the
   script offer "re-use last" on subsequent runs.
-- All language-related and prompt-construction helpers (`lang_label`,
-  `slug_lang`, `canonical_lang_name`, `normalize_subtitle_langs`,
-  `lang_from_srt_path`, `default_quality_choice`, `extract_timecodes`,
-  `validate_timecodes`, `build_translate_prompt`,
-  `build_translate_fix_prompt`, `translated_srt_path`,
-  `broken_translated_srt_path`) are pure functions designed for
-  unit-testing. Keep them pure if you change them.
-  `build_translate_prompt` and `build_translate_fix_prompt` take the
-  template as a string argument so the file I/O stays out of the pure
-  layer.
+- **Parallel chunking**: cues are split into `CHUNK_SIZE`-sized
+  windows (default 1000) by `chunk_cues`, then dispatched to a
+  `ThreadPoolExecutor(max_workers=MAX_WORKERS)` (default 4). Each
+  worker runs its own `claude -p`. Tune the two constants near the
+  top of `scripts/translate.py` if you need different throughput vs
+  rate-limit tradeoffs. A single failed worker (empty claude
+  response, subprocess error) aborts the whole translation.
+- **Strict per-chunk filtering**: each `_translate_chunk` filters
+  claude's parsed response down to the cue IDs that were actually in
+  that chunk's input. Claude sometimes invents cue numbers from
+  neighboring ranges to keep its output line count matching when it
+  has merged two cues, and without the filter those bogus numbers
+  would overwrite real translations from adjacent chunks during the
+  global `dict.update()` merge.
+- **Retry pass for merged cues**: if the validation after the parallel
+  pass shows missing cues — typically because claude collapsed a
+  sentence-split pair like
+  `6045\tLike a dream,` + `6046\tmay not have actually occurred.`
+  into one translation — one extra synchronous `claude -p` call goes
+  out with just the missing cue IDs (provided there are at most
+  `MAX_RETRY_MISSING` of them; default 100). Re-translating in
+  isolation almost always succeeds because there are no neighbors to
+  merge with. If retry still leaves cues missing, the script writes
+  `<ID>.translated.<tgt>.broken.srt` and dies as before.
+- **Heartbeat**: a daemon thread (`_Heartbeat`) prints elapsed-time
+  + chunks-done every `HEARTBEAT_INTERVAL_S` seconds so long chunks
+  don't look hung. Stops automatically when all chunks finish.
+- All language- and SRT-handling helpers (`lang_label`, `slug_lang`,
+  `canonical_lang_name`, `normalize_subtitle_langs`,
+  `lang_from_srt_path`, `default_quality_choice`, `parse_source_cues`,
+  `chunk_cues`, `serialize_cues_for_prompt`,
+  `parse_claude_translations`, `validate_translation_coverage`,
+  `assemble_translated_srt`, `build_translate_prompt`,
+  `translated_srt_path`, `broken_translated_srt_path`) are pure
+  functions designed for unit-testing. Keep them pure if you change
+  them. `build_translate_prompt` takes the template as a string
+  argument so the file I/O stays out of the pure layer.
 
 ### Adding a new functional script
 

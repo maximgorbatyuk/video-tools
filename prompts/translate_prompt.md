@@ -2,52 +2,77 @@ You are translating subtitles from {{source_lang}} into {{target_lang}}.
 
 ## Input
 
-A single SubRip (.srt) subtitle file. Each cue has this structure:
+A numbered list of subtitle cues, one cue per line. Each line has this
+exact shape:
 
-    <cue_number>
-    HH:MM:SS,mmm --> HH:MM:SS,mmm
-    <one or more lines of {{source_lang}} text>
+    <cue_number><TAB><source text>
 
-Cues are separated by one blank line.
+where `<TAB>` is a single ASCII tab character (U+0009). For example:
+
+    1	Hunter Jeff to Captain Marc.
+    2	Team 2 has arrived the entrance of District B.
+    3	Jeff to Captain Marc.
+
+The source text on each line is a single line of {{source_lang}} —
+any line breaks inside the original cue have been collapsed to single
+spaces. Tabs inside the source text have also been collapsed to spaces,
+so the first tab on every line is always the separator between the
+cue number and the cue text.
 
 ## Task
 
-Emit a valid SubRip (.srt) subtitle file in {{target_lang}}. For every
-cue in the input, emit exactly one cue in the output with:
+For every input line, emit exactly one output line in the same shape:
 
-1. The same cue number on the first line.
-2. The same timecode line on the second line, byte-for-byte identical
-   to the input.
-3. The {{source_lang}} text translated into natural, fluent
-   {{target_lang}}, on the line(s) below the timecode.
+    <cue_number><TAB><translation in {{target_lang}}>
 
-Separate cues with one blank line, exactly as in standard SRT.
+Use the cue number from the input verbatim. Translate the text on the
+right side of the tab.
 
 ## Output rules
 
-- Output ONLY the .srt content. No preamble. No headings. No closing
-  remarks. No markdown code fences. No commentary. The very first
-  character of your response must be the `1` of the first cue.
-- **Do not include the original {{source_lang}} text** in the output.
-  Only the {{target_lang}} translation goes under each timecode.
-- **Preserve every timecode character-for-character.** Do not round,
-  re-format, shift, merge, or split timecodes. A timecode mismatch in
-  the output is a correctness failure that will fail an automated
-  Python check.
-- **Preserve the order and count of cues.** Do not reorder, merge,
-  split, or drop any cue. The number of cues you emit must equal the
-  number of cues in the input.
-- **Preserve meaning per sentence.** Translate naturally — not
-  word-for-word — but keep the meaning, tone, and register of each
-  sentence intact. Don't summarize, omit, or paraphrase away nuance.
+- Output ONLY the numbered translation lines. No preamble. No
+  headings. No closing remarks. No markdown code fences. No
+  commentary. The very first character of your response must be the
+  `1` of the first cue.
+- **Emit exactly one output line per input line, in the same order.**
+  The output line count must equal the input line count. A count
+  mismatch is a correctness failure.
+- **Reuse every cue number from the input verbatim.** Do not
+  renumber, skip, merge, or split cue numbers. If you find yourself
+  "running out of cues" and tempted to invent a new cue number to
+  pad the count back up, stop — go back and emit the cue you
+  skipped instead.
+- **Do not merge cues even when consecutive source cues form one
+  sentence.** Subtitles routinely split a single sentence across
+  multiple cues — the first ends with a comma and the next continues
+  the thought. Example:
+
+      6045	Like a dream,
+      6046	may not have actually occurred in real life.
+
+  Translate each source cue into its own output line with its own
+  cue number, splitting the {{target_lang}} sentence at the same
+  natural break (here: after the comma):
+
+      6045	Как во сне,
+      6046	который мог и не происходить наяву.
+
+  Never collapse two source cues into one output line.
+- **Use a single tab character** (U+0009) as the separator between
+  the cue number and the translated text. Do not use multiple spaces
+  or any other separator.
+- **Keep each translation on a single line.** Subtitle players wrap
+  long lines themselves; do not insert literal newlines inside a cue's
+  translated text.
+- **Translate naturally** — preserve meaning, tone, and register.
+  Don't summarize, omit, or paraphrase away nuance.
 - Keep proper nouns, technical terms, brand names, and code snippets
-  in their original form when an idiomatic {{target_lang}} rendering
-  doesn't exist.
-- If a cue contains multiple sentences, translate them all.
-- If a cue is empty or non-verbal (e.g. a music indicator, an applause
-  tag), emit a single short {{target_lang}} marker that conveys the
-  same idea.
+  in their original form when no idiomatic {{target_lang}} rendering
+  exists.
+- If an input cue is a non-verbal marker (e.g. `[music]`, `(applause)`,
+  `♪`), emit a short {{target_lang}} marker that conveys the same
+  idea, on its own line, with the same cue number.
 
-## SRT input
+## Cues to translate
 
-{{srt_text}}
+{{cues_block}}

@@ -26,8 +26,7 @@ video-tools/
 │   └── _common.py                 ← shared helpers (not user-facing)
 ├── prompts/
 │   ├── summary_prompt.md          ← used by transcribe.py's summary step
-│   ├── translate_prompt.md        ← used by translate.py's first translation pass
-│   └── translate_fix_prompt.md    ← used by translate.py's automatic fix-up on timecode validation failure
+│   └── translate_prompt.md        ← used by translate.py (numbered tab-delimited cue list; Python writes the timecodes)
 ├── docs/transcribe_instruction.md
 ├── results/                       ← per-video output folders (gitignored; created on first run)
 ├── README.md
