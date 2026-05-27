@@ -28,8 +28,16 @@ Prerequisites (all must be on PATH)
     ffmpeg        — needed by yt-dlp to merge     →  brew install ffmpeg
                     video + audio streams
     claude        — Claude Code CLI               →  npm install -g
-                    (used for the translation             @anthropic-ai/claude-code
-                     step)                            claude login
+                    (one of the two LLM CLIs;             @anthropic-ai/claude-code
+                     used for the translation         claude login
+                     step)
+    opencode      — opencode CLI                  →  brew install opencode
+                    (the other LLM CLI option;        opencode auth login
+                     gives access to GLM and
+                     other non-Claude models)
+
+    At translation time the user picks which of `claude` / `opencode` to
+    use and which model; only the chosen one needs to be installed.
 
 ------------------------------------------------------------------------
 Usage
@@ -45,7 +53,9 @@ sizes. Use it to diagnose hangs or unexpected failures.
 
 The script is fully interactive. Algorithm:
 
-    1. Preflight checks for yt-dlp, ffmpeg, claude.
+    1. Preflight checks for yt-dlp, ffmpeg. (The LLM CLI — claude or
+       opencode — is checked later, once the user picks which one to
+       translate with.)
     2. Prompt for a YouTube URL.
     3. Resolve it to the canonical 11-char video ID and fetch the
        video's title (both via yt-dlp).
@@ -83,13 +93,20 @@ The script is fully interactive. Algorithm:
            a numbered tab-delimited list — `<n>\t<source text>` — one
            cue per line, with timecodes stripped. Timecodes never
            leave Python, so they can't be corrupted.
-         - Split the cue list into chunks of `CHUNK_SIZE` cues and
+         - If a `<ID>.translated.<tgt>.broken.srt` cache from a prior
+           failed run exists, seed its already-translated cues and only
+           translate the ones still missing. If the cache already covers
+           every cue, skip the LLM entirely and jump to reassembly.
+         - When there's work to do, ask which LLM CLI (`claude` or
+           `opencode`) and which model to use — remembered in sidecars,
+           and the chosen tool is preflight-checked at this point.
+         - Split the remaining cue list into chunks of `CHUNK_SIZE` and
            dispatch up to `MAX_WORKERS` chunks in parallel via
-           `concurrent.futures.ThreadPoolExecutor`. Each worker runs
-           its own `claude -p` subprocess. A background heartbeat
-           thread prints elapsed time + chunks-done every
-           `HEARTBEAT_INTERVAL_S` seconds so a slow chunk never looks
-           hung.
+           `concurrent.futures.ThreadPoolExecutor`. Each worker runs its
+           own LLM subprocess (`claude -p` or `opencode run`, prompt piped
+           via stdin). A background heartbeat thread prints elapsed time +
+           chunks-done every `HEARTBEAT_INTERVAL_S` seconds so a slow
+           chunk never looks hung.
          - Per chunk: strictly filter the parsed response to cue numbers
            that were actually in that chunk's input. Claude sometimes
            hallucinates extra numbers from neighboring ranges (it
@@ -102,12 +119,15 @@ The script is fully interactive. Algorithm:
            sentence-split cues into one translation), do ONE retry
            call with just the missing cue IDs. Threshold:
            `MAX_RETRY_MISSING` — above that, skip retry.
-         - On final mismatch: concatenate the per-chunk raw outputs
-           into `<ID>.translated.<tgt>.broken.srt` and die.
+         - On final mismatch: write every cue translated so far to
+           `<ID>.translated.<tgt>.broken.srt` as a sorted, resumable
+           `<n>\t<text>` cache, then die. A subsequent run reads that
+           cache and only translates the cues still missing.
          - Reassemble the final SRT in Python, walking the source cue
            list and substituting each cue's translated text under the
            source's original cue number + timecode line. Write to
-           `<ID>.translated.<tgt>.srt`.
+           `<ID>.translated.<tgt>.srt` and delete the now-superseded
+           broken cache.
 
 ------------------------------------------------------------------------
 Outputs (all written into the per-video results folder)
@@ -128,10 +148,13 @@ Outputs (all written into the per-video results folder)
             into any video player that accepts SRT.
 
         <ID>.translated.<tgt>.broken.srt
-            Written only when Claude couldn't produce a timecode-
-            consistent translation after the automated fix-up attempt.
-            Kept on disk for inspection so you can salvage parts of
-            the translation by hand.
+            Written only when Claude couldn't cover every cue after the
+            retry pass. It is a sorted `<cue_num>\t<translation>` cache
+            of every cue translated so far — both a salvage artifact you
+            can inspect by hand and a resume point: re-running translate.py
+            on the same video seeds these cues and only translates the
+            missing ones, then deletes this file once the full
+            `<ID>.translated.<tgt>.srt` is written.
 
         <ID>.video-quality.txt
             Sidecar remembering the last chosen download height.
@@ -141,6 +164,15 @@ Outputs (all written into the per-video results folder)
 
         <ID>.translate-target-lang.txt
             Sidecar remembering the target language used last time.
+
+        <ID>.translate-tool.txt
+            Sidecar remembering the LLM CLI used last time
+            (`claude` or `opencode`).
+
+        <ID>.translate-model.txt
+            Sidecar remembering the model used last time (a claude alias
+            like `sonnet`, or an opencode `provider/model` string;
+            empty = the tool's own default).
 
 ------------------------------------------------------------------------
 Idempotency
@@ -153,6 +185,10 @@ Idempotency
       exists.
     * `<ID>.translated.<tgt>.srt` already exists → asks
       `[s]kip / [r]e-run with same / [c]hange target language`.
+    * `<ID>.translated.<tgt>.broken.srt` from a prior failed run is
+      treated as a partial-translation cache: its cues are seeded and
+      only the missing ones are re-translated. If it already covers
+      every cue, no claude calls are made at all.
     * Sidecars (`.translate-*-lang.txt`, `.video-quality.txt`) are
       offered as defaults on subsequent runs.
 
@@ -163,11 +199,15 @@ Limitations
       semantic errors in the translation itself.
     * Translation is parallelized across cue chunks (see CHUNK_SIZE
       and MAX_WORKERS below), but each individual chunk is a single
-      synchronous `claude -p` call. If a chunk's prompt exceeds
-      Claude's context window, that chunk fails. Tune CHUNK_SIZE
-      downwards if you hit that.
+      synchronous LLM call (`claude -p` or `opencode run`). If a chunk's
+      prompt exceeds the chosen model's context window, that chunk
+      fails. Tune CHUNK_SIZE downwards if you hit that.
     * No automatic retry on rate-limit or transient API errors — a
       single failed chunk aborts the whole translation.
+    * Output quality and format-adherence vary by model. Weaker models
+      may add preamble or drop cues more often; the tolerant parser,
+      the retry pass, and the resumable broken-cache mitigate this (you
+      can even re-run with a stronger model to fill the gaps).
     * Target language is restricted to English, Russian, or Kazakh by
       design. To add another, extend `prompt_target_language`,
       `_LANG_LABELS`, and `canonical_lang_name`.
@@ -179,7 +219,6 @@ import argparse
 import concurrent.futures
 import os
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -192,9 +231,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     available_subtitle_langs,
     available_video_heights,
-    check_claude,
     check_ffmpeg,
     check_yt_dlp,
+    choose_llm_backend,
     debug,
     die,
     download_subtitles_for_lang,
@@ -208,8 +247,8 @@ from _common import (  # noqa: E402
     is_verbose,
     ok,
     prompt_youtube_url,
+    run_llm,
     set_verbose,
-    time_block,
     warn,
 )
 
@@ -357,6 +396,14 @@ def target_lang_sidecar(video_id: str) -> Path:
 
 def quality_sidecar(video_id: str) -> Path:
     return Path(f"{video_id}.video-quality.txt")
+
+
+def tool_sidecar(video_id: str) -> Path:
+    return Path(f"{video_id}.translate-tool.txt")
+
+
+def model_sidecar(video_id: str) -> Path:
+    return Path(f"{video_id}.translate-model.txt")
 
 
 def read_sidecar(path: Path) -> Optional[str]:
@@ -710,6 +757,35 @@ def parse_claude_translations(output: str) -> dict[int, str]:
     return out
 
 
+def load_partial_translations(text: str, cues: list[Cue]) -> dict[int, str]:
+    """Parse a previously-saved partial/broken translation into {cue_num: text}.
+
+    `<ID>.translated.<tgt>.broken.srt` is a resumable cache: a tab-delimited
+    `<cue_num>\\t<translation>` list of every cue that was translated before
+    a prior run failed validation. We read it back through the same tolerant
+    parser used for claude's live output (so an older broken file written as
+    concatenated raw chunk dumps still parses), then keep only the cue numbers
+    that correspond to a translatable source cue — dropping any hallucinated
+    or out-of-range numbers, exactly as the per-chunk strict filter does.
+
+    Pure: no I/O.
+    """
+    translatable_ids = {n for (n, _tc, t) in cues if t}
+    parsed = parse_claude_translations(text)
+    return {n: t for n, t in parsed.items() if n in translatable_ids}
+
+
+def serialize_translations_cache(translations: dict[int, str]) -> str:
+    """Render {cue_num: translation} as sorted `<cue_num>\\t<text>` lines.
+
+    This is the on-disk form of `<ID>.translated.<tgt>.broken.srt` — a
+    resumable partial-translation cache. Sorted by cue number so it's easy
+    to diff/inspect by hand and so `load_partial_translations` reads it back
+    deterministically. Pure: no I/O.
+    """
+    return "\n".join(f"{n}\t{translations[n]}" for n in sorted(translations))
+
+
 def validate_translation_coverage(
     cues: list[Cue], translations: dict[int, str]
 ) -> list[str]:
@@ -817,37 +893,6 @@ def _debug_validation_summary(
 
 
 # ----------------------------------------------------------------------------
-# Claude invocation
-# ----------------------------------------------------------------------------
-
-def run_claude(prompt: str) -> str:
-    """Call `claude -p` with the prompt piped via stdin and return stdout.
-
-    Piping rather than passing the prompt as argv keeps us well under the
-    ~1 MB ARG_MAX limit on macOS — the fix-up prompt can easily exceed
-    that for long videos with many failing cues.
-    """
-    info("invoking claude CLI (this may take a minute for longer videos)…")
-    debug(f"claude prompt: {len(prompt)} chars (~{len(prompt.encode('utf-8')) / 1024:.1f} KB)")
-    try:
-        with time_block("claude -p"):
-            result = subprocess.run(
-                ["claude", "-p"],
-                input=prompt,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-    except subprocess.CalledProcessError as e:
-        die(
-            "`claude` CLI returned a non-zero exit code.",
-            f"stderr:\n{e.stderr}",
-        )
-    debug(f"claude response: {len(result.stdout)} chars")
-    return result.stdout
-
-
-# ----------------------------------------------------------------------------
 # Chunked-parallel translation: worker + heartbeat
 # ----------------------------------------------------------------------------
 
@@ -906,11 +951,13 @@ def _translate_chunk(
     target_name: str,
     chunk_idx: int,
     total_chunks: int,
+    tool: str,
+    model: Optional[str],
 ) -> tuple[dict[int, str], str]:
     """Translate one chunk of cues. Runs in a worker thread.
 
-    Returns (translations dict, raw claude output). Raises RuntimeError
-    on empty claude response; lets subprocess errors from run_claude
+    Returns (translations dict, raw LLM output). Raises RuntimeError
+    on empty LLM response; lets subprocess errors from run_llm
     propagate via SystemExit (which the future will surface to main).
     """
     cues_block = serialize_cues_for_prompt(chunk)
@@ -929,10 +976,10 @@ def _translate_chunk(
         f"({translatable_count} translatable cue(s), "
         f"{len(cues_block)} chars)"
     )
-    output = run_claude(prompt).strip()
+    output = run_llm(prompt, tool, model).strip()
     if not output:
         raise RuntimeError(
-            f"chunk {chunk_idx + 1}/{total_chunks}: claude returned empty."
+            f"chunk {chunk_idx + 1}/{total_chunks}: {tool} returned empty."
         )
     raw_translations = parse_claude_translations(output)
 
@@ -972,12 +1019,17 @@ def translate_subtitles(
 ) -> None:
     """Translate the SRT and write `<ID>.translated.<tgt>.srt`.
 
-    Timecodes are stripped before each claude call and re-emitted by
-    Python afterwards, so the LLM never sees them. The cue list is
-    split into `CHUNK_SIZE`-sized chunks, dispatched up to `MAX_WORKERS`
-    in parallel, then merged. Validation is cue-count parity only;
-    on mismatch the concatenated raw claude outputs are persisted to
-    `<ID>.translated.<tgt>.broken.srt` and the script dies. No retry.
+    Timecodes are stripped before each LLM call and re-emitted by Python
+    afterwards, so the model never sees them. Any prior
+    `<ID>.translated.<tgt>.broken.srt` cache is seeded first, so only the
+    still-missing cues are translated (and none at all if the cache is
+    complete). When there's work to do the user picks the CLI tool +
+    model (claude / opencode) via `choose_llm_backend`; the remaining cue
+    list is split into `CHUNK_SIZE`-sized chunks, dispatched up to
+    `MAX_WORKERS` in parallel, then merged. Validation is cue-count parity
+    only; missing cues trigger one isolated retry pass, and a still-failing
+    result is persisted to `<ID>.translated.<tgt>.broken.srt` before the
+    script dies.
     """
     out_path = translated_srt_path(video_id, target_lang)
     if out_path.exists():
@@ -1017,55 +1069,95 @@ def translate_subtitles(
             "The file may be empty or malformed.",
         )
 
-    chunks = chunk_cues(cues, CHUNK_SIZE)
-    info(
-        f"translating {len(translatable)} cue(s) "
-        f"in {len(chunks)} chunk(s) of up to {CHUNK_SIZE}; "
-        f"running up to {MAX_WORKERS} in parallel"
-    )
-    debug(
-        f"{srt_path.name}: {source_name} → {target_name}; "
-        f"chunk sizes: "
-        f"{[sum(1 for c in chunk if c[2]) for chunk in chunks]}"
-    )
-
     template = TRANSLATE_PROMPT_TEMPLATE.read_text(encoding="utf-8")
 
     all_translations: dict[int, str] = {}
-    raw_outputs: list[str] = []
-    t0 = time.monotonic()
 
-    with _Heartbeat(total=len(chunks)) as hb:
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=MAX_WORKERS,
-            thread_name_prefix="translate",
-        ) as pool:
-            futures = [
-                pool.submit(
-                    _translate_chunk,
-                    chunk, template, source_name, target_name,
-                    i, len(chunks),
-                )
-                for i, chunk in enumerate(chunks)
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                chunk_translations, raw = future.result()
-                all_translations.update(chunk_translations)
-                raw_outputs.append(raw)
-                hb.mark_done()
+    # ----- Resume from a prior broken/partial translation -------------------
+    #
+    # If a previous run left a `<ID>.translated.<tgt>.broken.srt` behind, it
+    # is a resumable cache: a sorted `<cue_num>\t<text>` list of every cue
+    # that was translated before that run failed validation. Seed those so
+    # we only call claude for the cues still missing — and skip claude
+    # entirely if the cache already covers every translatable cue.
+    broken_path = broken_translated_srt_path(video_id, target_lang)
+    if broken_path.exists():
+        seed = load_partial_translations(
+            broken_path.read_text(encoding="utf-8"), cues,
+        )
+        if seed:
+            all_translations.update(seed)
+            info(
+                f"found {broken_path.name}: resuming with "
+                f"{len(seed)}/{len(translatable)} cue(s) already translated"
+            )
+        else:
+            debug(f"{broken_path.name} present but parsed to 0 usable cues")
 
-    elapsed = time.monotonic() - t0
-    info(f"all chunks completed in {elapsed:.1f}s")
+    pending_ids = {n for (n, _tc, t) in cues if t} - set(all_translations)
+    pending = [c for c in cues if c[2] and c[0] in pending_ids]
+
+    # Bound for the retry pass below; only ever read when pending was
+    # non-empty (a full cache hit produces no issues and skips both).
+    tool: Optional[str] = None
+    model: Optional[str] = None
+
+    if not pending:
+        ok(
+            f"existing translation cache already covers all "
+            f"{len(translatable)} cue(s) — no LLM calls needed."
+        )
+    else:
+        # Pick the CLI tool + model (claude / opencode), preflight it, and
+        # remember the choice in sidecars for next time.
+        prev_tool = read_sidecar(tool_sidecar(video_id))
+        prev_model = read_sidecar(model_sidecar(video_id))
+        tool, model = choose_llm_backend(prev_tool, prev_model)
+        write_sidecar(tool_sidecar(video_id), tool)
+        write_sidecar(model_sidecar(video_id), model or "")
+
+        chunks = chunk_cues(pending, CHUNK_SIZE)
+        info(
+            f"translating {len(pending)} remaining cue(s) "
+            f"in {len(chunks)} chunk(s) of up to {CHUNK_SIZE}; "
+            f"running up to {MAX_WORKERS} in parallel"
+        )
+        debug(
+            f"{srt_path.name}: {source_name} → {target_name}; "
+            f"chunk sizes: {[len(chunk) for chunk in chunks]}"
+        )
+
+        t0 = time.monotonic()
+        with _Heartbeat(total=len(chunks)) as hb:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=MAX_WORKERS,
+                thread_name_prefix="translate",
+            ) as pool:
+                futures = [
+                    pool.submit(
+                        _translate_chunk,
+                        chunk, template, source_name, target_name,
+                        i, len(chunks), tool, model,
+                    )
+                    for i, chunk in enumerate(chunks)
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    chunk_translations, _raw = future.result()
+                    all_translations.update(chunk_translations)
+                    hb.mark_done()
+
+        elapsed = time.monotonic() - t0
+        info(f"all chunks completed in {elapsed:.1f}s")
 
     issues = validate_translation_coverage(cues, all_translations)
     _debug_validation_summary(cues, all_translations, issues)
 
-    # ----- Retry pass for cues claude merged out of existence ---------------
+    # ----- Retry pass for cues the model merged out of existence ------------
     #
-    # Most failures of the main pass are claude merging two consecutive
+    # Most failures of the main pass are the model merging two consecutive
     # source cues (typically a sentence split across cues like
     # "Like a dream,\nmay not have actually occurred."). Re-translating
-    # those cues in isolation almost always succeeds since claude has no
+    # those cues in isolation almost always succeeds since the model has no
     # adjacent context to merge into.
     if issues:
         translatable_set = {n for (n, _tc, t) in cues if t}
@@ -1073,7 +1165,7 @@ def translate_subtitles(
         if missing and len(missing) <= MAX_RETRY_MISSING:
             info(
                 f"retry pass: {len(missing)} cue(s) missing from the main "
-                f"pass (claude likely merged them with neighbors). "
+                f"pass (the model likely merged them with neighbors). "
                 f"Re-translating in isolation…"
             )
             src_by_id = {n: (n, tc, t) for (n, tc, t) in cues}
@@ -1087,8 +1179,7 @@ def translate_subtitles(
                     f"retry prompt: {len(retry_prompt)} chars for "
                     f"{len(missing)} cue(s)"
                 )
-                with time_block("claude -p (retry)"):
-                    retry_output = run_claude(retry_prompt).strip()
+                retry_output = run_llm(retry_prompt, tool, model).strip()
                 retry_translations = parse_claude_translations(retry_output)
                 missing_set = set(missing)
                 retry_translations = {
@@ -1096,7 +1187,6 @@ def translate_subtitles(
                     if n in missing_set
                 }
                 all_translations.update(retry_translations)
-                raw_outputs.append(retry_output)
                 ok(
                     f"retry pass: recovered "
                     f"{len(retry_translations)}/{len(missing)} cue(s)"
@@ -1110,20 +1200,23 @@ def translate_subtitles(
             )
 
     if issues:
-        broken_path = broken_translated_srt_path(video_id, target_lang)
-        sep = "\n\n# === END OF CHUNK ===\n\n"
+        # Persist everything translated so far as a sorted, resumable cache
+        # (see the resume block above) so the next run only fills the gaps
+        # instead of re-translating from scratch.
         broken_path.write_text(
-            sep.join(raw_outputs).rstrip() + "\n", encoding="utf-8",
+            serialize_translations_cache(all_translations) + "\n",
+            encoding="utf-8",
         )
         preview = "\n".join(issues[:10])
         more = f"\n…and {len(issues) - 10} more." if len(issues) > 10 else ""
         die(
-            "claude's response did not cover every source cue, even after "
+            "the model's response did not cover every source cue, even after "
             "the retry pass.",
             "Issues:\n"
             f"{preview}{more}\n\n"
-            f"The concatenated raw claude outputs have been saved to "
-            f"{broken_path} for inspection.",
+            f"The cues translated so far have been saved to {broken_path} as "
+            f"a resumable cache — just re-run translate.py on the same video "
+            f"and it will translate only the missing cues.",
         )
 
     ok(
@@ -1135,6 +1228,10 @@ def translate_subtitles(
     out_path.write_text(final_srt, encoding="utf-8")
     write_sidecar(source_lang_sidecar(video_id), source_lang)
     write_sidecar(target_lang_sidecar(video_id), target_lang)
+    # The partial cache is now superseded by a complete translation.
+    if broken_path.exists():
+        broken_path.unlink()
+        info(f"removed {broken_path.name} (translation now complete)")
     try:
         size_kb = out_path.stat().st_size / 1024
         debug(f"{out_path.name}: {size_kb:.1f} KB written")
@@ -1210,7 +1307,8 @@ def main() -> int:
     info("Preflight checks…")
     check_yt_dlp()
     check_ffmpeg()
-    check_claude()
+    # The LLM CLI (claude or opencode) is checked later, once the user picks
+    # which one to translate with — neither is required just to download.
 
     url = prompt_youtube_url()
     video_id = get_video_id(url)

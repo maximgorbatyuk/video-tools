@@ -39,7 +39,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
 # (menu key, label shown to the user, file under scripts/)
 SCRIPTS: list[tuple[str, str, str]] = [
     ("1", "Transcribe a YouTube video (mlx_whisper, runs locally)", "transcribe.py"),
-    ("2", "Download video + subtitles, optionally translate to EN/RU/KK (claude)", "translate.py"),
+    ("2", "Download video + subtitles, optionally translate to EN/RU/KK (claude or opencode)", "translate.py"),
 ]
 
 

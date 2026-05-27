@@ -29,9 +29,16 @@ Prerequisites (all must be on PATH)
                     (NOT a Homebrew formula)     pipx ensurepath
                                                  pipx install mlx-whisper
     claude        — Claude Code CLI           →  npm install -g
-                    (only used if the user        @anthropic-ai/claude-code
-                     opts into the summary       claude login
-                     step at the end)
+                    (one LLM CLI option for       @anthropic-ai/claude-code
+                     the optional summary        claude login
+                     step)
+    opencode      — opencode CLI              →  brew install opencode
+                    (the other LLM CLI            opencode auth login
+                     option; GLM + other
+                     non-Claude models)
+
+Only one of `claude` / `opencode` is needed, and only if you opt into the
+summary step — the script asks which to use at that point.
 
 The turbo model (~1.5 GB) is downloaded automatically on first use and
 cached at  ~/.cache/huggingface/hub/  for subsequent runs.
@@ -50,8 +57,9 @@ unexpected failures.
 
 The script is fully interactive. The algorithm is:
 
-    1. Preflight checks for yt-dlp, ffmpeg, and mlx_whisper. (`claude` is
-       only checked later, on demand, since the summary step is opt-in.)
+    1. Preflight checks for yt-dlp, ffmpeg, and mlx_whisper. (The LLM CLI
+       — claude or opencode — is only checked later, on demand, since the
+       summary step is opt-in.)
     2. Prompt for a YouTube URL.
     3. Resolve it to the canonical 11-char video ID and fetch the
        video's title (both via yt-dlp).
@@ -69,12 +77,14 @@ The script is fully interactive. The algorithm is:
        warning, not an error.
     8. Run `mlx_whisper` to produce SRT/TXT/VTT/JSON/TSV and a
        paragraph-grouped dialogue.txt.
-    9. Ask whether to summarize the transcript via `claude`. If yes:
-         - Preflight `claude`.
+    9. Ask whether to summarize the transcript with an LLM. If yes:
+         - Ask which LLM CLI (`claude` or `opencode`) and which model to
+           use — remembered in sidecars — and preflight the chosen tool.
          - Prompt for speaker name and (optional) context — sidecar-
            backed so re-runs offer "re-use last".
          - Substitute into the template at `prompts/summary_prompt.md`,
-           feed the result to `claude -p`, and write `<ID>.summary.md`.
+           feed the result to the chosen LLM (prompt piped via stdin),
+           and write `<ID>.summary.md`.
 
 ------------------------------------------------------------------------
 Outputs (all written into the per-video results folder)
@@ -88,11 +98,17 @@ Outputs (all written into the per-video results folder)
                                   with [HH:MM:SS] timecodes per paragraph
         <ID>.lang.txt           — sidecar: language used for the last
                                   whisper run
-        <ID>.summary.md         — (optional) claude-generated long-form
+        <ID>.summary.md         — (optional) LLM-generated long-form
                                   summary of the transcript
         <ID>.summary-speaker.txt   — sidecar: speaker name for the summary
         <ID>.summary-context.txt   — sidecar: speaker context for the
                                               summary
+        <ID>.summary-tool.txt      — sidecar: LLM CLI used for the summary
+                                              (`claude` or `opencode`)
+        <ID>.summary-model.txt     — sidecar: model used for the summary
+                                              (claude alias or opencode
+                                              `provider/model`; empty =
+                                              the tool's default)
 
 mlx_whisper also writes <ID>.vtt, <ID>.json, and <ID>.tsv as side effects
 of `--output-format all`; they are not used downstream by this script.
@@ -143,9 +159,9 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import (  # noqa: E402
-    check_claude,
     check_ffmpeg,
     check_yt_dlp,
+    choose_llm_backend,
     debug,
     die,
     download_subtitles_for_lang,
@@ -157,6 +173,7 @@ from _common import (  # noqa: E402
     is_verbose,
     ok,
     prompt_youtube_url,
+    run_llm,
     set_verbose,
     time_block,
     warn,
@@ -433,6 +450,8 @@ def write_dialogue_txt(video_id: str) -> None:
 
 SUMMARY_SPEAKER_SIDECAR_TMPL = "{vid}.summary-speaker.txt"
 SUMMARY_CONTEXT_SIDECAR_TMPL = "{vid}.summary-context.txt"
+SUMMARY_TOOL_SIDECAR_TMPL = "{vid}.summary-tool.txt"
+SUMMARY_MODEL_SIDECAR_TMPL = "{vid}.summary-model.txt"
 
 
 def summary_output_path(video_id: str) -> Path:
@@ -536,35 +555,9 @@ def build_summary_prompt(template: str, speaker: str, context: str, transcript: 
     )
 
 
-def run_claude(prompt: str) -> str:
-    """Call `claude -p` with the prompt piped via stdin and return stdout.
-
-    Piping rather than passing the prompt as argv keeps us well under the
-    ~1 MB ARG_MAX limit on macOS — long transcripts can easily exceed that.
-    """
-    info("invoking claude CLI (this may take a minute for longer transcripts)…")
-    debug(f"claude prompt: {len(prompt)} chars (~{len(prompt.encode('utf-8')) / 1024:.1f} KB)")
-    try:
-        with time_block("claude -p"):
-            result = subprocess.run(
-                ["claude", "-p"],
-                input=prompt,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-    except subprocess.CalledProcessError as e:
-        die(
-            "`claude` CLI returned a non-zero exit code.",
-            f"stderr:\n{e.stderr}",
-        )
-    debug(f"claude response: {len(result.stdout)} chars")
-    return result.stdout
-
-
 def maybe_summarize(video_id: str) -> None:
     print()
-    if not prompt_yes_no("Summarize this video with claude?"):
+    if not prompt_yes_no("Summarize this video?"):
         info("Skipping summary.")
         return
 
@@ -581,8 +574,6 @@ def maybe_summarize(video_id: str) -> None:
             f"a transcript.",
         )
 
-    check_claude()
-
     force_reprompt = False
     out_path = summary_output_path(video_id)
     if out_path.exists():
@@ -592,14 +583,22 @@ def maybe_summarize(video_id: str) -> None:
         if choice == "change":
             force_reprompt = True
 
+    # Pick the CLI tool + model (claude / opencode), preflight it, and
+    # remember the choice in sidecars for next time.
+    tool_p = Path(SUMMARY_TOOL_SIDECAR_TMPL.format(vid=video_id))
+    model_p = Path(SUMMARY_MODEL_SIDECAR_TMPL.format(vid=video_id))
+    tool, model = choose_llm_backend(
+        _read_text_sidecar(tool_p), _read_text_sidecar(model_p)
+    )
+
     speaker, context = prompt_summary_inputs(video_id, force_reprompt=force_reprompt)
     template = SUMMARY_PROMPT_TEMPLATE.read_text(encoding="utf-8")
     transcript = transcript_path.read_text(encoding="utf-8")
 
     prompt = build_summary_prompt(template, speaker, context, transcript)
-    output = run_claude(prompt).strip()
+    output = run_llm(prompt, tool, model).strip()
     if not output:
-        die("claude returned an empty response.")
+        die(f"{tool} returned an empty response.")
 
     out_path.write_text(output + "\n", encoding="utf-8")
     _write_text_sidecar(
@@ -608,6 +607,8 @@ def maybe_summarize(video_id: str) -> None:
     _write_text_sidecar(
         Path(SUMMARY_CONTEXT_SIDECAR_TMPL.format(vid=video_id)), context
     )
+    _write_text_sidecar(tool_p, tool)
+    _write_text_sidecar(model_p, model or "")
     ok(f"wrote {out_path}")
 
 

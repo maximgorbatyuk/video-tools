@@ -94,19 +94,29 @@ a prompt.
 These must be installed on the user's macOS Apple Silicon machine. Every
 functional script that depends on one of these MUST preflight-check for it
 on `PATH` and bail out with a copy-paste-able install hint if it's missing.
-Shared preflight helpers (`check_yt_dlp`, `check_ffmpeg`) live in
-`scripts/_common.py`.
+Shared preflight helpers (`check_yt_dlp`, `check_ffmpeg`, `check_claude`,
+`check_opencode`) live in `scripts/_common.py`.
 
 | Tool | Used by | Install |
 |---|---|---|
 | `yt-dlp` | `scripts/transcribe.py`, `scripts/translate.py` | `brew install yt-dlp` |
 | `ffmpeg` | `scripts/transcribe.py`, `scripts/translate.py` | `brew install ffmpeg` |
 | `mlx_whisper` | `scripts/transcribe.py` | `brew install pipx && pipx ensurepath && pipx install mlx-whisper` |
-| `claude` | `scripts/translate.py` (always); `scripts/transcribe.py` (only if the user opts into the summary step) | `npm install -g @anthropic-ai/claude-code && claude login` |
+| `claude` | `scripts/translate.py` + `scripts/transcribe.py` summary — **one of two** LLM CLI options | `npm install -g @anthropic-ai/claude-code && claude login` |
+| `opencode` | `scripts/translate.py` + `scripts/transcribe.py` summary — the **other** LLM CLI option (GLM + other non-Claude models) | `brew install opencode && opencode auth login` |
+
+The LLM step in each script is satisfied by **either** `claude` **or**
+`opencode` — the user picks at runtime via `choose_llm_backend`, and only
+the chosen one is preflight-checked (via `check_llm_tool`). Neither is
+required just to download. The shared invocation wrapper is
+`run_llm(prompt, tool, model)`; both read the prompt from stdin and print
+the reply as plain text to stdout.
 
 Notes:
 - `mlx-whisper` is **not** a Homebrew formula. Install via `pipx`. The binary
   is named `mlx_whisper` (underscore).
+- `opencode` models are addressed as `provider/model` strings (e.g.
+  `zai-coding-plan/glm-5.1`); `opencode models` lists every advertised one.
 - The Whisper turbo model (~1.5 GB) auto-downloads to
   `~/.cache/huggingface/hub/` on first transcription. A missing cache is a
   warning, not a fatal error.
@@ -181,8 +191,10 @@ Use suffixes to disambiguate purposes:
   SRTs.
 - Sidecars: `<ID>.<purpose>.txt` (e.g. `<ID>.lang.txt`,
   `<ID>.translate-source-lang.txt`, `<ID>.translate-target-lang.txt`,
+  `<ID>.translate-tool.txt`, `<ID>.translate-model.txt`,
   `<ID>.video-quality.txt`, `<ID>.summary-speaker.txt`,
-  `<ID>.summary-context.txt`)
+  `<ID>.summary-context.txt`, `<ID>.summary-tool.txt`,
+  `<ID>.summary-model.txt`)
 
 #### Per-video results folder
 
@@ -312,17 +324,30 @@ part of the implementation, not a follow-up.
 ### `scripts/_common.py`
 
 - Helpers shared by both functional scripts: log functions, preflight checks
-  (`check_yt_dlp`, `check_ffmpeg`, `check_claude`), YouTube URL prompt + ID
-  resolver + title fetch, `get_video_metadata` (one-shot `yt-dlp -J`),
-  pure parsers `available_video_heights` / `available_subtitle_langs` over
-  that metadata, `download_video` (idempotent; accepts `max_height`,
-  defaults 720p), `download_subtitles_for_lang` (per-language SRT fetch,
-  idempotent, best-effort), `find_existing_artifacts` (returns the mp4
-  and the list of `<ID>.<lang>.srt` files in CWD — used by translate.py's
-  idempotency gate), `video_title_to_slug` + `find_or_create_results_dir`
-  (per-video results folder), SRT timecode regex, `count_cue_blocks`.
+  (`check_yt_dlp`, `check_ffmpeg`, `check_claude`, `check_opencode`), YouTube
+  URL prompt + ID resolver + title fetch, `get_video_metadata` (one-shot
+  `yt-dlp -J`), pure parsers `available_video_heights` /
+  `available_subtitle_langs` over that metadata, `download_video`
+  (idempotent; accepts `max_height`, defaults 720p),
+  `download_subtitles_for_lang` (per-language SRT fetch, idempotent,
+  best-effort), `find_existing_artifacts` (returns the mp4 and the list of
+  `<ID>.<lang>.srt` files in CWD — used by translate.py's idempotency gate),
+  `video_title_to_slug` + `find_or_create_results_dir` (per-video results
+  folder), SRT timecode regex, `count_cue_blocks`.
+- **LLM backend layer** (shared by both scripts): `run_llm(prompt, tool,
+  model)` invokes the chosen CLI (`claude -p [--model …]` or `opencode run
+  [-m provider/model]`), prompt piped via stdin, returns stdout (both tools
+  print the bare reply to stdout; opencode's banner goes to stderr).
+  `check_llm_tool` dispatches to `check_claude` / `check_opencode`.
+  `choose_llm_backend(prev_tool, prev_model)` runs the interactive picker
+  (`prompt_llm_tool` → `prompt_claude_model` for claude's opus/sonnet/haiku
+  aliases, or `prompt_opencode_model` which lists all `opencode models`
+  numbered), preflights the chosen tool, and returns `(tool, model)`.
+  `model is None` means "the tool's configured default" (no `--model`/`-m`).
+  Callers persist the pair in their own sidecars.
 - Side-effect-free at import time. Do not add module-level `print`, `input`,
-  or `sys.exit` calls.
+  or `sys.exit` calls. (Interactive helpers that call `input()` at *call*
+  time — like `prompt_youtube_url`, `prompt_llm_tool` — are fine.)
 - Leading underscore signals "internal module". Don't register it in
   `start.py`.
 
@@ -341,14 +366,16 @@ part of the implementation, not a follow-up.
 - Sidecar `<ID>.lang.txt` records the last language used so re-runs can
   offer "same language".
 - **Summary step (opt-in)**: after dialogue.txt is written, the script
-  asks `Summarize this video with claude? [y/N]`. If yes, it preflight-
-  checks `claude`, asks for a speaker name and optional context (both
-  sidecar-backed via `<ID>.summary-speaker.txt` and
-  `<ID>.summary-context.txt`), substitutes them along with the
-  dialogue.txt body into `prompts/summary_prompt.md` using plain
-  `str.replace()`, calls `claude -p`, and writes `<ID>.summary.md`. A
-  re-run with an existing summary offers `[s]/[r]/[c]`. The prompt
-  template path is resolved from `__file__`, not CWD, so the chdir into
+  asks `Summarize this video? [y/N]`. If yes, it picks the LLM tool +
+  model via `choose_llm_backend` (sidecar-backed by `<ID>.summary-tool.txt`
+  and `<ID>.summary-model.txt`; the chosen tool is preflight-checked
+  there), asks for a speaker name and optional context (both sidecar-backed
+  via `<ID>.summary-speaker.txt` and `<ID>.summary-context.txt`),
+  substitutes them along with the dialogue.txt body into
+  `prompts/summary_prompt.md` using plain `str.replace()`, calls
+  `run_llm`, and writes `<ID>.summary.md`. A re-run with an existing
+  summary offers `[s]/[r]/[c]`. The prompt template path is resolved from
+  `__file__`, not CWD, so the chdir into
   the results folder doesn't break it.
 - No speaker diarization. If diarization becomes a requirement, the
   agreed-upon path is to layer `pyannote-audio` on top of mlx_whisper.
@@ -364,11 +391,14 @@ part of the implementation, not a follow-up.
   chosen height → loop `download_subtitles_for_lang` over every
   base-code subtitle language → ask whether to translate → pick source
   SRT → pick target (EN/RU/KK) → `parse_source_cues` → strip timecodes →
-  `chunk_cues` splits the cue list into `CHUNK_SIZE`-sized windows →
-  `ThreadPoolExecutor(max_workers=MAX_WORKERS)` dispatches one
-  `claude -p` per chunk in parallel (background `_Heartbeat` thread
-  prints progress every `HEARTBEAT_INTERVAL_S` seconds) → merge each
-  chunk's `parse_claude_translations` output → one global
+  seed any `<ID>.translated.<tgt>.broken.srt` cache from a prior failed
+  run and drop its cues from the work list → (if work remains) pick the
+  LLM tool + model via `choose_llm_backend` → `chunk_cues` splits the
+  *remaining* cue list into `CHUNK_SIZE`-sized windows →
+  `ThreadPoolExecutor(max_workers=MAX_WORKERS)` dispatches one `run_llm`
+  call per chunk in parallel (background `_Heartbeat` thread prints
+  progress every `HEARTBEAT_INTERVAL_S` seconds) → merge each chunk's
+  `parse_claude_translations` output → one global
   `validate_translation_coverage` over the merged dict →
   `assemble_translated_srt` writes the final SRT using the *source's*
   timecodes.
@@ -378,9 +408,9 @@ part of the implementation, not a follow-up.
   folder, the script lists what's there and asks
   `[p]roceed / [r]e-download`. Proceed jumps straight to the
   translation prompt. Re-download wipes the existing mp4 + per-language
-  SRTs but preserves sidecars (`.translate-*-lang.txt`,
-  `.video-quality.txt`) and any translation `.md` files, then runs the
-  full download flow.
+  SRTs but preserves all sidecars (`.translate-*-lang.txt`,
+  `.translate-tool.txt`, `.translate-model.txt`, `.video-quality.txt`)
+  and any translation `.md` files, then runs the full download flow.
 - **Quality menu**: heights are read from `yt-dlp -J`. Default is the
   previous sidecar value if still on offer, else the highest <= 720p,
   else the highest advertised height. Recorded in
@@ -396,7 +426,15 @@ part of the implementation, not a follow-up.
 - **Source language is picked from the downloaded SRT files** via a
   numbered menu (auto-skipped when only one SRT is on disk). The code is
   parsed from the filename by `lang_from_srt_path`.
-- **Timecodes never reach the LLM**. `parse_source_cues` parses the
+- **LLM tool + model are chosen per run** via `choose_llm_backend` (in
+  `_common.py`), but only when there's actual work — a complete
+  broken-cache hit makes zero LLM calls and asks nothing. The choice
+  (`claude`/`opencode` + model) is dispatched through `run_llm` from both
+  the parallel workers (`_translate_chunk` takes `tool, model`) and the
+  retry pass, and is remembered in `<ID>.translate-tool.txt` /
+  `<ID>.translate-model.txt`. An empty model sidecar means "the tool's
+  default". This is the only place translate.py shells out to an LLM —
+  there is no local `run_claude` anymore. `parse_source_cues` parses the
   source SRT into `[(cue_num, timecode_line, text)]` tuples;
   `serialize_cues_for_prompt` emits only `<cue_num>\t<text>` lines
   (translatable cues only). Claude returns the same shape with
@@ -407,20 +445,22 @@ part of the implementation, not a follow-up.
   Timecode corruption is impossible by construction.
 - **Validation is cue-count parity only**. `validate_translation_coverage`
   checks that every translatable source cue has a matching key in the
-  parsed translations. On mismatch the raw claude output is written to
-  `<ID>.translated.<tgt>.broken.srt` and the script dies — there is no
-  retry pass.
+  parsed translations. On mismatch (after the retry pass) the cues
+  translated so far are written to `<ID>.translated.<tgt>.broken.srt` as
+  a sorted `<cue_num>\t<text>` cache and the script dies.
 - **Output is a plain SubRip (.srt) file**, written by Python (not by
   claude). `<ID>.translated.<tgt>.srt` is ready for any video player.
   `<tgt>` is the lowercased 2-letter code produced by
   `lang_label(target_lang).lower()` (`ru`, `en`, `kk`).
-- Three sidecars (`<ID>.translate-source-lang.txt`,
-  `<ID>.translate-target-lang.txt`, `<ID>.video-quality.txt`) let the
+- Five sidecars (`<ID>.translate-source-lang.txt`,
+  `<ID>.translate-target-lang.txt`, `<ID>.video-quality.txt`,
+  `<ID>.translate-tool.txt`, `<ID>.translate-model.txt`) let the
   script offer "re-use last" on subsequent runs.
 - **Parallel chunking**: cues are split into `CHUNK_SIZE`-sized
   windows (default 1000) by `chunk_cues`, then dispatched to a
   `ThreadPoolExecutor(max_workers=MAX_WORKERS)` (default 4). Each
-  worker runs its own `claude -p`. Tune the two constants near the
+  worker runs its own `run_llm` call (`claude -p` or `opencode run`).
+  Tune the two constants near the
   top of `scripts/translate.py` if you need different throughput vs
   rate-limit tradeoffs. A single failed worker (empty claude
   response, subprocess error) aborts the whole translation.
@@ -439,8 +479,22 @@ part of the implementation, not a follow-up.
   out with just the missing cue IDs (provided there are at most
   `MAX_RETRY_MISSING` of them; default 100). Re-translating in
   isolation almost always succeeds because there are no neighbors to
-  merge with. If retry still leaves cues missing, the script writes
-  `<ID>.translated.<tgt>.broken.srt` and dies as before.
+  merge with. If retry still leaves cues missing, the cues translated so
+  far are written to `<ID>.translated.<tgt>.broken.srt` and the script
+  dies — the next run resumes from that cache (see below).
+- **Resume from a broken cache**: `<ID>.translated.<tgt>.broken.srt` is
+  not just a salvage artifact — it's a resumable partial-translation
+  cache. At the start of a translation `load_partial_translations` reads
+  it (filtering to valid source cue IDs, so hallucinated/out-of-range
+  numbers are dropped), seeds those translations, and only the
+  still-missing cues are chunked and sent to claude. If the cache already
+  covers every translatable cue, **no `claude -p` calls are made at all**
+  and the script jumps straight to assembly. On a fully-successful run
+  the broken file is deleted, since the complete
+  `<ID>.translated.<tgt>.srt` supersedes it. The cache is written by
+  `serialize_translations_cache` (sorted `<cue_num>\t<text>`) rather than
+  concatenated raw chunk output, so a failed re-run merges into the
+  previous cache instead of losing it.
 - **Heartbeat**: a daemon thread (`_Heartbeat`) prints elapsed-time
   + chunks-done every `HEARTBEAT_INTERVAL_S` seconds so long chunks
   don't look hung. Stops automatically when all chunks finish.
@@ -448,7 +502,8 @@ part of the implementation, not a follow-up.
   `canonical_lang_name`, `normalize_subtitle_langs`,
   `lang_from_srt_path`, `default_quality_choice`, `parse_source_cues`,
   `chunk_cues`, `serialize_cues_for_prompt`,
-  `parse_claude_translations`, `validate_translation_coverage`,
+  `parse_claude_translations`, `load_partial_translations`,
+  `serialize_translations_cache`, `validate_translation_coverage`,
   `assemble_translated_srt`, `build_translate_prompt`,
   `translated_srt_path`, `broken_translated_srt_path`) are pure
   functions designed for unit-testing. Keep them pure if you change

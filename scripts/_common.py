@@ -6,7 +6,10 @@ It exposes:
 
     Log helpers:    info / ok / warn / err / die / debug
     Verbose mode:   set_verbose, is_verbose, time_block
-    Preflight:      check_yt_dlp, check_ffmpeg, check_claude
+    Preflight:      check_yt_dlp, check_ffmpeg, check_claude, check_opencode
+    LLM backend:    run_llm, check_llm_tool, choose_llm_backend,
+                    prompt_llm_tool, prompt_claude_model,
+                    prompt_opencode_model, list_opencode_models
     YouTube:        YOUTUBE_ID_RE, prompt_youtube_url, get_video_id,
                     get_video_title, get_video_metadata,
                     available_video_heights, available_subtitle_langs,
@@ -147,6 +150,222 @@ def check_claude() -> None:
             "Then open a new terminal so PATH picks it up.",
         )
     ok("claude CLI found")
+
+
+def check_opencode() -> None:
+    """Verify the `opencode` CLI is on PATH."""
+    if shutil.which("opencode") is None:
+        die(
+            "`opencode` CLI is not installed or not on PATH.",
+            "Install it with Homebrew:\n"
+            "\n"
+            "    brew install opencode\n"
+            "\n"
+            "Then authenticate a provider (e.g. `opencode auth login`) and "
+            "open a new terminal so PATH picks it up.",
+        )
+    ok("opencode CLI found")
+
+
+# ----------------------------------------------------------------------------
+# LLM backend (claude / opencode) — tool + model selection and invocation
+# ----------------------------------------------------------------------------
+#
+# Both functional scripts call an LLM CLI for their text-generation steps
+# (translate.py to translate cues, transcribe.py to summarize a transcript).
+# The user picks which CLI ("claude" or "opencode") and, optionally, which
+# model. Both tools read the prompt from stdin and print the model's reply as
+# plain text to stdout (verified: opencode's banner goes to stderr, stdout is
+# the bare reply), so run_llm treats them uniformly. The chosen (tool, model)
+# pair is remembered by each script in its own sidecar files.
+#
+# Model semantics: `model is None` means "let the tool use its configured
+# default" (no --model / -m flag). For claude, a non-None model is an alias
+# ('opus'/'sonnet'/'haiku'); for opencode it's a 'provider/model' string.
+
+LLM_TOOLS = ("claude", "opencode")
+
+# claude model aliases offered in the menu. "default" maps to None (omit
+# --model and let claude use whatever it's configured for).
+_CLAUDE_MODELS = ("default", "opus", "sonnet", "haiku")
+
+
+def check_llm_tool(tool: str) -> None:
+    """Preflight the chosen LLM CLI ('claude' or 'opencode')."""
+    if tool == "claude":
+        check_claude()
+    elif tool == "opencode":
+        check_opencode()
+    else:
+        die(f"Unknown LLM tool: {tool!r}.")
+
+
+def run_llm(prompt: str, tool: str, model: Optional[str] = None) -> str:
+    """Run the chosen LLM CLI with `prompt` piped via stdin; return stdout.
+
+    Both backends read the prompt from stdin (keeping us well under macOS's
+    ~1 MB ARG_MAX) and print the reply as plain text to stdout:
+
+        claude   ->  claude -p [--model <alias>]
+        opencode ->  opencode run [-m <provider/model>]
+
+    `model` is None to use the tool's configured default, the claude alias
+    ('opus'/'sonnet'/'haiku'), or the opencode 'provider/model' string.
+    Raises SystemExit (via die) on a non-zero exit code.
+    """
+    if tool == "claude":
+        cmd = ["claude", "-p"]
+        if model:
+            cmd += ["--model", model]
+    elif tool == "opencode":
+        cmd = ["opencode", "run"]
+        if model:
+            cmd += ["-m", model]
+    else:
+        die(f"Unknown LLM tool: {tool!r}.")
+        return ""  # unreachable; for the type-checker
+
+    label = f"{tool} ({model or 'default'})"
+    info(f"invoking {tool} (this may take a minute for longer inputs)…")
+    debug(
+        f"{tool} prompt: {len(prompt)} chars "
+        f"(~{len(prompt.encode('utf-8')) / 1024:.1f} KB); argv={cmd}"
+    )
+    try:
+        with time_block(label):
+            result = subprocess.run(
+                cmd, input=prompt, check=True, capture_output=True, text=True,
+            )
+    except subprocess.CalledProcessError as e:
+        die(
+            f"`{tool}` returned a non-zero exit code.",
+            f"stderr:\n{e.stderr}",
+        )
+        return ""  # unreachable; for the type-checker
+    debug(f"{tool} response: {len(result.stdout)} chars")
+    return result.stdout
+
+
+def list_opencode_models() -> list[str]:
+    """Return opencode's advertised `provider/model` list (best-effort).
+
+    Empty list on any failure — callers fall back to free-text entry.
+    """
+    if shutil.which("opencode") is None:
+        return []
+    try:
+        with time_block("opencode models"):
+            result = subprocess.run(
+                ["opencode", "models"],
+                check=True, capture_output=True, text=True,
+            )
+    except subprocess.CalledProcessError as e:
+        debug(f"`opencode models` failed: {e.stderr}")
+        return []
+    return [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+
+
+def prompt_llm_tool(previous: Optional[str] = None) -> str:
+    """Ask which LLM CLI to use. Returns 'claude' or 'opencode'."""
+    default = previous if previous in LLM_TOOLS else "claude"
+    while True:
+        raw = input(
+            f"\nWhich CLI tool should run the model? "
+            f"[c]laude / [o]pencode [default: {default}]: "
+        ).strip().lower()
+        if not raw:
+            return default
+        if raw in ("c", "claude"):
+            return "claude"
+        if raw in ("o", "opencode"):
+            return "opencode"
+        warn("Please enter 'c' for claude or 'o' for opencode.")
+
+
+def prompt_claude_model(previous: Optional[str] = None) -> Optional[str]:
+    """Numbered menu of claude model aliases.
+
+    Returns 'opus'/'sonnet'/'haiku', or None for claude's configured default.
+    `previous` is the last-used alias (None / 'default' both mean default).
+    """
+    models = _CLAUDE_MODELS
+    default = previous if previous in models else "default"
+    print()
+    info("claude model:")
+    for i, m in enumerate(models, 1):
+        marker = "  ← previous" if m == default else ""
+        print(f"  [{i}] {m}{marker}")
+
+    def _resolve(alias: str) -> Optional[str]:
+        return None if alias == "default" else alias
+
+    while True:
+        raw = input(
+            f"\nPick a model [1-{len(models)}, Enter for {default}]: "
+        ).strip()
+        if not raw:
+            return _resolve(default)
+        if raw.isdigit():
+            n = int(raw)
+            if 1 <= n <= len(models):
+                return _resolve(models[n - 1])
+        warn(f"Please enter a number between 1 and {len(models)}.")
+
+
+def prompt_opencode_model(previous: Optional[str] = None) -> Optional[str]:
+    """Numbered menu of every model `opencode models` advertises.
+
+    Returns a 'provider/model' string, or None to use opencode's configured
+    default. Falls back to free-text entry if the model list can't be fetched.
+    """
+    models = list_opencode_models()
+    if not models:
+        warn("Could not list opencode models — enter one manually.")
+        raw = input(
+            "opencode model (provider/model, blank = opencode's default): "
+        ).strip()
+        return raw or None
+
+    default = previous if previous in models else None
+    print()
+    info(f"opencode models ({len(models)} available):")
+    for i, m in enumerate(models, 1):
+        marker = "  ← previous" if m == default else ""
+        print(f"  [{i}] {m}{marker}")
+
+    hint = f", Enter for {default}" if default else ""
+    while True:
+        raw = input(f"\nPick a model [1-{len(models)}{hint}]: ").strip()
+        if not raw and default:
+            return default
+        if raw.isdigit():
+            n = int(raw)
+            if 1 <= n <= len(models):
+                return models[n - 1]
+        warn(f"Please enter a number between 1 and {len(models)}.")
+
+
+def choose_llm_backend(
+    prev_tool: Optional[str] = None,
+    prev_model: Optional[str] = None,
+) -> tuple[str, Optional[str]]:
+    """Interactively pick (tool, model), preflight the tool, and return both.
+
+    `prev_tool` / `prev_model` come from the caller's sidecars and are offered
+    as defaults. `prev_model` is only treated as a default when it belongs to
+    the chosen tool. The tool is preflight-checked right after it's picked, so
+    a missing CLI bails out before the (possibly long) model menu. Returns
+    (tool, model) where model is None for the tool's own default.
+    """
+    tool = prompt_llm_tool(prev_tool)
+    check_llm_tool(tool)
+    model_default = prev_model if prev_tool == tool else None
+    if tool == "claude":
+        model = prompt_claude_model(model_default)
+    else:
+        model = prompt_opencode_model(model_default)
+    info(f"using {tool}" + (f" / {model}" if model else " (default model)"))
+    return tool, model
 
 
 # ----------------------------------------------------------------------------

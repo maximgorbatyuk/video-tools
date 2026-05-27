@@ -238,7 +238,11 @@ results/
 *.lang.txt
 *.translate-source-lang.txt
 *.translate-target-lang.txt
+*.translate-tool.txt
+*.translate-model.txt
 *.video-quality.txt
 *.summary-speaker.txt
 *.summary-context.txt
+*.summary-tool.txt
+*.summary-model.txt
 .DS_Store

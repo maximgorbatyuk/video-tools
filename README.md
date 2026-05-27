@@ -50,8 +50,8 @@ you want.
 
 | Script | Purpose | Host CLI deps |
 |---|---|---|
-| [`scripts/transcribe.py`](./scripts/transcribe.py) | Downloads a YouTube video at 720p, best-effort fetches its YouTube-hosted subtitles, and transcribes the audio locally with `mlx_whisper` + the `whisper-large-v3-turbo` model. All outputs land inside `results/<YYYY-MM-DD>_<video-slug>/`. At the end the script offers to summarize the transcript via `claude` using the template in [`prompts/summary_prompt.md`](./prompts/summary_prompt.md). | `yt-dlp`, `ffmpeg`, `mlx_whisper`, `claude` (only for the optional summary step) |
-| [`scripts/translate.py`](./scripts/translate.py) | Downloads a YouTube video at a quality you pick (only the resolutions YouTube actually serves are offered) plus every subtitle language the platform advertises. Then optionally translates one of those subtitle files to **English, Russian, or Kazakh** via the `claude` CLI and writes the result as a plain `.srt` file (`<ID>.translated.<tgt>.srt`). Timecodes are validated in Python after each Claude pass — if any drift, the script asks Claude to redo the translation once before giving up. All outputs land inside `results/<YYYY-MM-DD>_<video-slug>/`. Re-running on a video whose files are already on disk gates with `[p]roceed / [r]e-download`. | `yt-dlp`, `ffmpeg`, `claude` |
+| [`scripts/transcribe.py`](./scripts/transcribe.py) | Downloads a YouTube video at 720p, best-effort fetches its YouTube-hosted subtitles, and transcribes the audio locally with `mlx_whisper` + the `whisper-large-v3-turbo` model. All outputs land inside `results/<YYYY-MM-DD>_<video-slug>/`. At the end the script offers to summarize the transcript with an LLM (you pick `claude` or `opencode` + a model) using the template in [`prompts/summary_prompt.md`](./prompts/summary_prompt.md). | `yt-dlp`, `ffmpeg`, `mlx_whisper`, and — for the optional summary — `claude` **or** `opencode` |
+| [`scripts/translate.py`](./scripts/translate.py) | Downloads a YouTube video at a quality you pick (only the resolutions YouTube actually serves are offered) plus every subtitle language the platform advertises. Then optionally translates one of those subtitle files to **English, Russian, or Kazakh**. You choose which LLM CLI (`claude` or `opencode`) and which model (e.g. a GLM model via opencode) runs the translation; the result is written as a plain `.srt` file (`<ID>.translated.<tgt>.srt`). Translation runs in parallel chunks with a cue-count check, an automatic retry, and a resumable cache if anything is left uncovered. All outputs land inside `results/<YYYY-MM-DD>_<video-slug>/`. Re-running on a video whose files are already on disk gates with `[p]roceed / [r]e-download`. | `yt-dlp`, `ffmpeg`, and `claude` **or** `opencode` |
 
 ### Reference docs
 
@@ -65,10 +65,11 @@ you want.
 ## Prerequisites (host machine)
 
 Both scripts need `yt-dlp` and `ffmpeg`. `mlx_whisper` is only required for
-`transcribe.py`. `claude` is required by `translate.py` always, and by
-`transcribe.py` only if you opt into the summary step at the end. Each
-script preflight-checks its own dependencies and bails out with an install
-hint if anything is missing.
+`transcribe.py`. For the LLM step (always in `translate.py`; opt-in in
+`transcribe.py`'s summary) you need **one of** `claude` **or** `opencode` —
+you pick which at runtime, so only the one you choose has to be installed.
+Each script preflight-checks its own dependencies and bails out with an
+install hint if anything is missing.
 
 ```bash
 # Shared
@@ -79,15 +80,19 @@ brew install pipx
 pipx ensurepath
 pipx install mlx-whisper
 
-# Needed by scripts/translate.py (always) and scripts/transcribe.py (only
-# if you opt into the summary step at the end). Claude Code CLI provides
-# the `claude` binary.
+# LLM CLI — install whichever you want to translate/summarize with (or both).
+# Claude Code provides the `claude` binary:
 npm install -g @anthropic-ai/claude-code
 claude login
+
+# opencode gives access to GLM and other non-Claude models:
+brew install opencode
+opencode auth login
 ```
 
 After installing pipx-managed or npm-global tools, restart your terminal so
-`PATH` picks them up.
+`PATH` picks them up. `opencode` addresses models as `provider/model`
+(e.g. `zai-coding-plan/glm-5.1`); run `opencode models` to list them all.
 
 The Whisper turbo model (~1.5 GB) is downloaded on first transcription run
 and cached at `~/.cache/huggingface/hub/`.
@@ -108,13 +113,18 @@ You'll be asked which script to run:
 
 What do you want to do?
   [1] Transcribe a YouTube video (mlx_whisper, runs locally)
-  [2] Download video + subtitles, optionally translate to EN/RU/KK (claude)
+  [2] Download video + subtitles, optionally translate to EN/RU/KK (claude or opencode)
 
 Pick 1/2:
 ```
 
 After picking, the selected functional script takes over and prompts for the
-remaining inputs (URL, language, etc.).
+remaining inputs (URL, language, etc.). When it reaches a step that needs an
+LLM (translation, or the optional summary), it asks which CLI tool
+(`claude` or `opencode`) and which model to use — `opencode` lists all its
+models in a numbered menu so you can pick a GLM model, for example. Your
+choice is remembered in sidecar files so the next run offers it as the
+default.
 
 ### Run a script directly
 
@@ -170,9 +180,11 @@ date).
 ├── <ID>.vtt, .json, .tsv    ← extra whisper formats (--output-format all)
 ├── <ID>.dialogue.txt        ← paragraph-grouped reading copy
 ├── <ID>.lang.txt            ← sidecar: language used last time
-├── <ID>.summary.md          ← (optional) claude-generated summary
+├── <ID>.summary.md          ← (optional) LLM-generated summary
 ├── <ID>.summary-speaker.txt ← sidecar: speaker name for the summary
-└── <ID>.summary-context.txt ← sidecar: speaker context for the summary
+├── <ID>.summary-context.txt ← sidecar: speaker context for the summary
+├── <ID>.summary-tool.txt    ← sidecar: LLM CLI used for the summary (claude/opencode)
+└── <ID>.summary-model.txt   ← sidecar: model used for the summary
 ```
 
 ### `scripts/translate.py`
@@ -186,10 +198,12 @@ the same layout as `transcribe.py`. The date prefix is the date of the
 ├── <ID>.mp4                            ← video at the chosen quality
 ├── <ID>.<lang>.srt                     ← one file per advertised subtitle language
 ├── <ID>.translated.<tgt>.srt           ← translated subtitles, plain .srt ready for any player (e.g. .translated.ru.srt)
-├── <ID>.translated.<tgt>.broken.srt    ← (only if Claude failed timecode validation; kept for inspection)
+├── <ID>.translated.<tgt>.broken.srt    ← (only if a run failed to cover every cue) resumable cache of cues translated so far; re-running fills the gaps, then deletes this file
 ├── <ID>.video-quality.txt              ← sidecar: last chosen download height
 ├── <ID>.translate-source-lang.txt      ← sidecar: source language used last time
-└── <ID>.translate-target-lang.txt      ← sidecar: target language used last time
+├── <ID>.translate-target-lang.txt      ← sidecar: target language used last time
+├── <ID>.translate-tool.txt             ← sidecar: LLM CLI used last time (claude/opencode)
+└── <ID>.translate-model.txt            ← sidecar: model used last time (claude alias or opencode provider/model)
 ```
 
 ### Idempotency
@@ -205,6 +219,13 @@ automatically.
 translation using the existing files, or `[r]e-download` everything from
 scratch in one go. The redownload path preserves sidecars and any
 previously-completed `<ID>.translated.<tgt>.srt` files.
+
+If a previous translation failed partway (leaving a
+`<ID>.translated.<tgt>.broken.srt`), translation also resumes from it:
+the cues already translated are reused and only the missing ones are
+sent to claude. If that file already contains every cue, no claude calls
+are made — the script just assembles the final `.srt`. The broken file
+is deleted once a complete translation is written.
 
 ## License
 
